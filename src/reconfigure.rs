@@ -110,6 +110,7 @@ impl Floodwall {
         settings.rate_limit.validate()?;
         let now = self.advance(now);
         self.apply_settings(settings);
+        self.settings_label = Some(label.to_string());
         let tick = self.ledger.advance_clock(now);
         debug_assert_eq!(tick, now, "the ledger's clock ran ahead of the plane's");
         let evidence = Evidence {
@@ -126,7 +127,7 @@ impl Floodwall {
         Ok(())
     }
 
-    fn apply_settings(&mut self, settings: Settings) {
+    pub(crate) fn apply_settings(&mut self, settings: Settings) {
         self.gate = settings.gate;
         self.admission.set_rate_limit(settings.rate_limit);
         self.scheduler.set_config(settings.scheduler);

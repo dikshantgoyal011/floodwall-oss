@@ -23,7 +23,20 @@
 //!   or `null`), `settings` (every label the ledger names, and `initial`,
 //!   mapped to [settings](#settings)), `initial` (the label the plane was
 //!   built under), `ledger` (the lines stored so far, joined with `\n`, or
-//!   `""`; the export's header line may be left off), `now`.
+//!   `""`; the export's header line may be left off), `now`, and
+//!   optionally `snapshot` (a string: the text of a snapshot the `snapshot`
+//!   op returned, or `null`). With a snapshot, `ledger` holds only the
+//!   lines stored after it (the snapshot's own checkpoint line may lead
+//!   them), and the plane takes up the snapshot's state and replays only
+//!   those lines (see [`crate::snapshot`]); `settings` must then also map
+//!   the label the snapshot names. Without one, it replays every line.
+//! - `snapshot`: `snapshot`, the plane's state as a snapshot's text (see
+//!   [Text form](crate::snapshot#text-form)), taken at the ledger's most
+//!   recent checkpoint: if records came after that checkpoint, one is cut
+//!   now, and its line is in this answer's `lines`. `null` if the plane has
+//!   no checkpoint yet (none is cut unless `checkpoint_every` is set). Store
+//!   it with the lines up to its checkpoint; the lines after it are all a
+//!   later `open` needs with it.
 //! - `submit`: `intent` (in the export's intent form), `now`. The intent is
 //!   offered, and if it gets in a pass runs at once: `accepted`, `refused`
 //!   (why not), `report`.
@@ -35,13 +48,15 @@
 //! - `reconfigure`: `label`, `settings`, `now` (see [`crate::reconfigure`]).
 //! - `keyring`: `keyring`. Replaces the keyring.
 //! - `state`: the queue, what is in flight and what is held, the clock, the
-//!   ledger's length and head, and the stats in Prometheus text.
+//!   ledger's length (every record, before a snapshot too) and head, and
+//!   the stats in Prometheus text.
 //! - `dry_run`: `settings`, `intents`. Each intent's gate decision under
 //!   those settings; needs no open plane and changes nothing.
 //! - `keys`: the keys auditors check the ledger with (see
 //!   [`keys_json`](crate::export::keys_json)).
 //! - `verify`: whether the ledger verifies, and how many checkpoints carry
-//!   the plane's signature.
+//!   the plane's signature. A plane opened from a snapshot verifies the
+//!   lines after it, from its checkpoint.
 //!
 //! # Settings
 //!
@@ -68,7 +83,7 @@ use crate::json::{self, Value};
 use crate::reconfigure::Settings;
 use crate::{
     Aging, Floodwall, Gate, HoldConfig, Keyring, Lease, Ledger, Outcome, RateLimit, Rejected,
-    SchedulerConfig, SigningKey, TickReport, VerifyingKey,
+    SchedulerConfig, SigningKey, Snapshot, TickReport, VerifyingKey,
 };
 
 /// A plane and what of its ledger the host has been given.
@@ -220,6 +235,20 @@ impl Host {
                 Ok(String::new())
             }
             "state" => Ok(self.state()?),
+            "snapshot" => {
+                let plane = self.plane()?;
+                if plane.ledger().checkpoints().is_empty() {
+                    return Ok(",\"snapshot\":null".into());
+                }
+                // At a call's end, so a checkpoint cut now has a state.
+                plane.checkpoint();
+                let snapshot = plane
+                    .snapshot()
+                    .expect("the checkpoint just cut covers every record");
+                let mut out = String::from(",\"snapshot\":");
+                json_str(&mut out, &snapshot.to_json());
+                Ok(out)
+            }
             "dry_run" => {
                 let settings = read_settings(get(request, "settings")?)?;
                 let Value::Array(intents) = get(request, "intents")? else {
@@ -268,7 +297,7 @@ impl Host {
                 Ok(format!(
                     ",\"verified\":{},\"records\":{},\"checkpoints\":{},\"signed_checkpoints\":{signed}",
                     ledger.verify(),
-                    ledger.len(),
+                    ledger.size(),
                     ledger.checkpoints().len()
                 ))
             }
@@ -295,7 +324,25 @@ impl Host {
         let now = tick(get(request, "now")?)?;
 
         let text = string(get(request, "ledger")?, "ledger")?;
-        let mut ledger = if text.is_empty() {
+        let snapshot = match get(request, "snapshot") {
+            Err(_) | Ok(Value::Null) => None,
+            Ok(v) => Some(
+                Snapshot::from_json(string(v, "snapshot")?)
+                    .map_err(|e| bad(format!("snapshot: {e}")))?,
+            ),
+        };
+        let mut ledger = if let Some(snapshot) = &snapshot {
+            // The lines after the snapshot's checkpoint, as the host stored
+            // them.
+            let mut lines = String::with_capacity(text.len() + 1);
+            lines.push_str(text);
+            if !lines.is_empty() && !lines.ends_with('\n') {
+                lines.push('\n');
+            }
+            snapshot
+                .read_tail(lines.as_bytes())
+                .map_err(|e| bad(format!("ledger: {e}")))?
+        } else if text.is_empty() {
             Ledger::new()
         } else {
             // The host stores the lines it was given; the header and the
@@ -335,21 +382,21 @@ impl Host {
         if first.rate_limit.validate().is_err() {
             return Err(bad("the initial settings' rate limit is invalid"));
         }
-        let mut plane = first.build(capacity);
+        let mut plane = first.build(capacity).with_settings_label(initial);
         if let Some(keyring) = read_keyring(get(request, "keyring")?)? {
             plane = plane.with_keyring(keyring);
         }
-        let plane = if ledger.is_empty() {
-            let mut plane = plane.with_ledger(ledger);
-            plane.tick(now);
-            plane
-        } else {
-            plane
-                .resume_with(ledger, now, |label| {
-                    settings.get(label).and_then(|v| read_settings(v).ok())
-                })
-                .map_err(|e| Refusal("cannot_resume", e.to_string()))?
-        };
+        let named = |label: &str| settings.get(label).and_then(|v| read_settings(v).ok());
+        let plane = match &snapshot {
+            Some(snapshot) => plane.resume_from_snapshot(snapshot, ledger, now, named),
+            None if ledger.is_empty() => {
+                let mut plane = plane.with_ledger(ledger);
+                plane.tick(now);
+                Ok(plane)
+            }
+            None => plane.resume_with(ledger, now, named),
+        }
+        .map_err(|e| Refusal("cannot_resume", e.to_string()))?;
         self.records_out = stored_records;
         self.checkpoints_out = stored_checkpoints;
         self.plane = Some(plane);
@@ -392,7 +439,7 @@ impl Host {
             out.push('}');
         }
         out.push_str("],\"ledger\":{\"records\":");
-        out.push_str(&plane.ledger().len().to_string());
+        out.push_str(&plane.ledger().size().to_string());
         out.push_str(",\"head\":");
         json_str(&mut out, &plane.ledger().head().to_string());
         out.push_str("},\"prometheus\":");
@@ -418,7 +465,14 @@ impl Host {
             json_str(out, line);
         };
         let mut cp = self.checkpoints_out;
-        for record in &ledger.records()[self.records_out.min(ledger.len())..] {
+        let held = self.records_out.min(ledger.len());
+        // A checkpoint cut with no record since, as `snapshot` cuts one.
+        let at = ledger.size() - (ledger.len() - held) as u64;
+        while let Some(c) = checkpoints.get(cp).filter(|c| c.size == at) {
+            push(&mut out, &checkpoint_line(c));
+            cp += 1;
+        }
+        for record in &ledger.records()[held..] {
             push(&mut out, &record_line(record));
             while let Some(c) = checkpoints.get(cp) {
                 if c.size != record.seq + 1 {
@@ -771,6 +825,174 @@ mod tests {
                 .clone();
         }
         v
+    }
+
+    /// `open`, from `snapshot` and the lines after it.
+    fn open_from(snapshot: &str, ledger: &str) -> String {
+        let plain = open(ledger);
+        let mut field = String::from(",\"snapshot\":");
+        json_str(&mut field, snapshot);
+        format!("{}{field}}}", &plain[..plain.len() - 1])
+    }
+
+    fn snapshot_of(answer: &str) -> String {
+        match field(answer, &["snapshot"]) {
+            Value::String(s) => s,
+            other => panic!("no snapshot but {other:?} in {answer}"),
+        }
+    }
+
+    /// The same calls on two hosts give the same answers and lines.
+    fn both(a: &mut Host, b: &mut Host, request: &str) -> String {
+        let (x, y) = (a.handle(request), b.handle(request));
+        assert_eq!(x, y, "{request}");
+        assert_eq!(field(&x, &["ok"]), Value::Bool(true), "{x}");
+        x
+    }
+
+    #[test]
+    fn a_plane_reopens_from_a_snapshot_and_the_lines_after_it() {
+        let mut host = Host::new();
+        let mut stored = Vec::new();
+        stored.extend(lines(&host.handle(&open(""))));
+        let submit = |id: u64, resource: &str, now: u64| {
+            format!(
+                "{{\"op\":\"submit\",\"intent\":{},\"now\":{now}}}",
+                intent("bot", id, resource)
+            )
+        };
+        for request in [
+            submit(1, "web", 1),
+            submit(2, "db", 2), // held: not on the list
+            "{\"op\":\"reconfigure\",\"label\":\"v2\",\"settings\":{\"burst\":2},\"now\":3}".into(),
+            submit(3, "web", 3), // queued behind bot#1
+            "{\"op\":\"complete\",\"agent\":\"bot\",\"id\":\"1\",\"outcome\":\"succeeded\",\"reason\":null,\"now\":4}".into(),
+        ] {
+            stored.extend(lines(&host.handle(&request)));
+        }
+        // Seven records so far, the last checkpoint at six: the snapshot
+        // cuts one at the end.
+        let a = host.handle("{\"op\":\"snapshot\"}");
+        let new = lines(&a);
+        assert_eq!(new.len(), 1, "{new:?}");
+        assert!(new[0].contains("\"type\":\"checkpoint\""), "{new:?}");
+        stored.extend(new);
+        let snapshot = snapshot_of(&a);
+        assert!(snapshot.contains("\"settings\":\"v2\""), "{snapshot}");
+        // Asked again with nothing new, the same snapshot and no new line.
+        let again = host.handle("{\"op\":\"snapshot\"}");
+        assert_eq!(snapshot_of(&again), snapshot);
+        assert!(lines(&again).is_empty());
+        let after = stored.len();
+
+        for request in [
+            "{\"op\":\"tick\",\"now\":5}".to_string(),
+            "{\"op\":\"release\",\"agent\":\"bot\",\"id\":\"2\",\"by\":\"alice\",\"now\":6}".into(),
+        ] {
+            stored.extend(lines(&host.handle(&request)));
+        }
+        let state = plane_state(&mut host);
+
+        // Reopened from the snapshot and only the lines after it.
+        let tail = stored[after..].join("\n");
+        let mut reopened = Host::new();
+        let a = reopened.handle(&open_from(&snapshot, &tail));
+        assert_eq!(field(&a, &["ok"]), Value::Bool(true), "{a}");
+        assert!(lines(&a).is_empty());
+        assert_eq!(plane_state(&mut reopened), state);
+        let verify = reopened.handle("{\"op\":\"verify\"}");
+        assert_eq!(field(&verify, &["verified"]), Value::Bool(true), "{verify}");
+        assert_eq!(field(&verify, &["records"]), Value::Number(10));
+        assert_eq!(
+            field(&verify, &["signed_checkpoints", "failed_at"]),
+            Value::Null,
+            "{verify}"
+        );
+        // The snapshot's own checkpoint line may lead the tail.
+        let mut led = Host::new();
+        let a = led.handle(&open_from(&snapshot, &stored[after - 1..].join("\n")));
+        assert_eq!(field(&a, &["ok"]), Value::Bool(true), "{a}");
+        assert_eq!(plane_state(&mut led), state);
+
+        // It keeps working exactly as the plane that never stopped.
+        for request in [
+            submit(4, "web", 7),
+            "{\"op\":\"tick\",\"now\":8}".into(),
+            "{\"op\":\"complete\",\"agent\":\"bot\",\"id\":\"3\",\"outcome\":\"failed\",\"reason\":\"no\",\"now\":9}".into(),
+            "{\"op\":\"snapshot\"}".into(),
+            "{\"op\":\"keys\"}".into(),
+        ] {
+            both(&mut host, &mut reopened, &request);
+        }
+        assert_eq!(plane_state(&mut reopened), plane_state(&mut host));
+        let verify = reopened.handle("{\"op\":\"verify\"}");
+        assert_eq!(field(&verify, &["verified"]), Value::Bool(true), "{verify}");
+        // And reopens again, from its latest snapshot.
+        let latest = snapshot_of(&host.handle("{\"op\":\"snapshot\"}"));
+        let mut third = Host::new();
+        let a = third.handle(&open_from(&latest, ""));
+        assert_eq!(field(&a, &["ok"]), Value::Bool(true), "{a}");
+        assert_eq!(plane_state(&mut third), plane_state(&mut host));
+    }
+
+    /// What `state` says of the plane, without the stats, which start
+    /// afresh when a plane is opened.
+    fn plane_state(host: &mut Host) -> String {
+        let answer = host.handle("{\"op\":\"state\"}");
+        ["clock", "queued", "in_flight", "held", "ledger"]
+            .map(|name| format!("{:?}", field(&answer, &[name])))
+            .join("\n")
+    }
+
+    #[test]
+    fn a_snapshot_needs_a_checkpoint_and_must_match_its_lines() {
+        // No checkpoints: no snapshot.
+        let mut host = Host::new();
+        let plain = open("").replace("\"checkpoint_every\":2", "\"checkpoint_every\":null");
+        host.handle(&plain);
+        let a = host.handle("{\"op\":\"snapshot\"}");
+        assert_eq!(field(&a, &["snapshot"]), Value::Null, "{a}");
+
+        let mut host = Host::new();
+        let mut stored = lines(&host.handle(&open("")));
+        stored.extend(lines(&host.handle(&format!(
+            "{{\"op\":\"submit\",\"intent\":{},\"now\":1}}",
+            intent("bot", 1, "web")
+        ))));
+        let snapshot = snapshot_of(&host.handle("{\"op\":\"snapshot\"}"));
+        // A damaged snapshot is refused.
+        let damaged = snapshot.replacen("\"clock\":\"1\"", "\"clock\":\"2\"", 1);
+        assert_ne!(damaged, snapshot);
+        let a = Host::new().handle(&open_from(&damaged, ""));
+        assert_eq!(
+            field(&a, &["code"]),
+            Value::String("bad_request".into()),
+            "{a}"
+        );
+        // So are lines that do not follow it: the whole ledger, say.
+        let a = Host::new().handle(&open_from(&snapshot, &stored.join("\n")));
+        assert_eq!(
+            field(&a, &["code"]),
+            Value::String("bad_request".into()),
+            "{a}"
+        );
+        // And a snapshot naming settings the request does not give.
+        let mut host = Host::new();
+        host.handle(&open(""));
+        host.handle(&format!(
+            "{{\"op\":\"submit\",\"intent\":{},\"now\":1}}",
+            intent("bot", 1, "web")
+        ));
+        host.handle(
+            "{\"op\":\"reconfigure\",\"label\":\"v3\",\"settings\":{\"burst\":3},\"now\":1}",
+        );
+        let snapshot = snapshot_of(&host.handle("{\"op\":\"snapshot\"}"));
+        let a = Host::new().handle(&open_from(&snapshot, ""));
+        assert_eq!(
+            field(&a, &["code"]),
+            Value::String("cannot_resume".into()),
+            "{a}"
+        );
     }
 
     #[test]

@@ -16,7 +16,9 @@
 //! record the ledger holds, digest for digest. The result is the plane as
 //! it was: the queue in order, each agent's rate-limit bucket, what is in
 //! flight and since when, each resource's conflict claims, what is held and
-//! why, which held intents were released and by whom, and the clock.
+//! why, which held intents were released and by whom, and the clock. To
+//! wake a plane without replaying its whole ledger, resume it from a
+//! [snapshot](crate::snapshot) and the records after it.
 //!
 //! ```
 //! use floodwall::{Admission, Floodwall, Gate, Ledger, RateLimit};
@@ -171,6 +173,14 @@ pub enum ResumeError {
     /// The plane has already queued or recorded something. Resume a plane
     /// that is newly built.
     NotFresh,
+    /// The ledger starts at a checkpoint, not at genesis
+    /// ([`Ledger::starting_at`]): resume from it with the snapshot taken at
+    /// that checkpoint ([`Floodwall::resume_from_snapshot`]).
+    NotFromGenesis,
+    /// The snapshot cannot be resumed from: the ledger does not start at its
+    /// checkpoint, the settings it names were not given, or this plane
+    /// cannot hold what it holds (see [`crate::snapshot`]).
+    Snapshot(String),
     /// The ledger does not verify ([`Ledger::verify`]).
     Unverified,
     /// The plane has a keyring, and this record's intent is not signed by
@@ -204,6 +214,10 @@ impl fmt::Display for ResumeError {
             ResumeError::NotFresh => f.write_str(
                 "the plane has already queued or recorded something; resume a newly built plane",
             ),
+            ResumeError::NotFromGenesis => f.write_str(
+                "the ledger starts at a checkpoint; resume from it with the snapshot taken there",
+            ),
+            ResumeError::Snapshot(why) => write!(f, "cannot resume from the snapshot: {why}"),
             ResumeError::Unverified => f.write_str("the ledger does not verify"),
             ResumeError::Unauthenticated(e) => {
                 write!(f, "the ledger's history is not authenticated: {e}")
@@ -230,9 +244,9 @@ impl std::error::Error for ResumeError {}
 /// `keyring` holds for it, current or retired. Each intent is checked once,
 /// however many records carry it. Records not about an intent are left to
 /// the replay, which refuses them.
-fn authenticate(ledger: &Ledger, keyring: &Keyring) -> Result<(), ResumeError> {
+pub(crate) fn authenticate(records: &[Record], keyring: &Keyring) -> Result<(), ResumeError> {
     let mut checked: HashSet<(Digest, [u8; 64])> = HashSet::new();
-    for r in ledger.records() {
+    for r in records {
         let Some(intent) = &r.intent else { continue };
         let fail = |problem| {
             Err(ResumeError::Unauthenticated(SignatureError {
@@ -405,21 +419,49 @@ impl Floodwall {
     /// settings the ledger started under.
     pub fn resume_with(
         mut self,
-        mut ledger: Ledger,
+        ledger: Ledger,
         now: u64,
-        mut settings: impl FnMut(&str) -> Option<Settings>,
+        settings: impl FnMut(&str) -> Option<Settings>,
     ) -> Result<Floodwall, ResumeError> {
-        if !self.ledger.is_empty() || !self.admission.is_empty() || !self.live.is_empty() {
-            return Err(ResumeError::NotFresh);
+        self.check_fresh()?;
+        if ledger.size() != ledger.len() as u64 {
+            return Err(ResumeError::NotFromGenesis);
         }
         if !ledger.verify() {
             return Err(ResumeError::Unverified);
         }
         if let Some(keyring) = &self.keyring {
-            authenticate(&ledger, keyring)?;
+            authenticate(ledger.records(), keyring)?;
         }
         // Replay into a ledger of our own, then compare.
         self.ledger = Ledger::new();
+        self.catch_up(ledger, now, settings)
+    }
+
+    /// Fail with [`ResumeError::NotFresh`] unless the plane is newly built.
+    pub(crate) fn check_fresh(&self) -> Result<(), ResumeError> {
+        if self.ledger.size() != 0 || !self.admission.is_empty() || !self.live.is_empty() {
+            return Err(ResumeError::NotFresh);
+        }
+        Ok(())
+    }
+
+    /// Replay every record `ledger` holds on this plane, which is as the
+    /// plane that wrote them was just before the first, recording into a
+    /// ledger of its own that ends where that plane's did; finish a call
+    /// `ledger` ends partway through; then keep recording in `ledger`, at
+    /// tick `now`. `ledger` has been verified and, with a keyring,
+    /// authenticated.
+    pub(crate) fn catch_up(
+        mut self,
+        mut ledger: Ledger,
+        now: u64,
+        mut settings: impl FnMut(&str) -> Option<Settings>,
+    ) -> Result<Floodwall, ResumeError> {
+        debug_assert_eq!(
+            self.ledger.head(),
+            ledger.records().first().map_or(ledger.head(), |r| r.prev)
+        );
         let stored = ledger.records();
         let mut next = 0;
         while let Some(record) = stored.get(next) {

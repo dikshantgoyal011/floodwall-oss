@@ -230,6 +230,38 @@ impl Hold {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Held> {
         self.entries.values()
     }
+
+    /// Every held intent with its slot, oldest first, and the slot the next
+    /// one takes, for a [snapshot](crate::snapshot).
+    pub(crate) fn slots(&self) -> (Vec<(u64, Held)>, u64) {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(slot, held)| (*slot, held.clone()))
+            .collect();
+        (entries, self.next)
+    }
+
+    /// Take up what a [snapshot](crate::snapshot) kept in place of what is
+    /// held, keeping the configuration. Fails, changing nothing, if a slot
+    /// or an intent comes twice, or a slot is not below `next`.
+    pub(crate) fn restore(&mut self, entries: &[(u64, Held)], next: u64) -> Result<(), String> {
+        let mut by_slot = BTreeMap::new();
+        let mut index = HashMap::new();
+        for (slot, held) in entries {
+            let key = held.intent.key();
+            if *slot >= next || by_slot.insert(*slot, held.clone()).is_some() {
+                return Err(format!("hold slot {slot} is out of place"));
+            }
+            if index.insert(key.clone(), *slot).is_some() {
+                return Err(format!("{key} is held twice"));
+            }
+        }
+        self.entries = by_slot;
+        self.index = index;
+        self.next = next;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

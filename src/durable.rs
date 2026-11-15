@@ -383,10 +383,24 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// Rebuild a ledger from complete export lines, each ending with `\n`,
 /// checking every line in order.
 fn load(bytes: &[u8]) -> Result<Ledger, ReadError> {
-    let mut ledger = Ledger::new();
+    load_into(Ledger::new(), bytes, true)
+}
+
+/// Add complete export lines, each ending with `\n`, to `ledger`, checking
+/// every line in order. With `header`, the first line must be a
+/// whole-ledger export's header; without, there is none, as in the lines
+/// after a checkpoint a ledger [starts at](Ledger::starting_at), where the
+/// checkpoint itself may be repeated first.
+pub(crate) fn load_into(
+    mut ledger: Ledger,
+    bytes: &[u8],
+    header: bool,
+) -> Result<Ledger, ReadError> {
     let mut offset = 0u64;
-    for (i, raw) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
-        let line = i as u64 + 1;
+    let first = usize::from(!header);
+    for (n, raw) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line = n as u64 + 1;
+        let i = n + first;
         let invalid = |problem: String| ReadError::Invalid {
             line,
             offset,
@@ -408,6 +422,8 @@ fn load(bytes: &[u8]) -> Result<Ledger, ReadError> {
             (0, _) => return Err(invalid("the first line must be the header".into())),
             (_, Line::Header { .. }) => return Err(invalid("a second header".into())),
             (_, Line::Record(r)) => ledger.restore_record(*r).map_err(invalid)?,
+            // The checkpoint a ledger starts at, written again first.
+            (1, Line::Checkpoint(c)) if !header && ledger.start() == Some(&c) => {}
             (_, Line::Checkpoint(c)) => ledger.restore_checkpoint(c).map_err(invalid)?,
         }
         offset += raw.len() as u64;

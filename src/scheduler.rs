@@ -347,12 +347,12 @@ impl SchedulerConfig {
 }
 
 /// A dispatched intent's claim on its `(resource, action)`.
-#[derive(Clone, Debug)]
-struct Claim {
-    key: IntentKey,
-    action: Action,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub(crate) key: IntentKey,
+    pub(crate) action: Action,
     /// When it completed; `None` while it is in flight.
-    done_at: Option<u64>,
+    pub(crate) done_at: Option<u64>,
 }
 
 impl Claim {
@@ -368,7 +368,7 @@ impl Claim {
 }
 
 /// An intent the gate admitted, which the caller is applying.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InFlight {
     /// The intent being applied.
     pub intent: Intent,
@@ -620,6 +620,82 @@ impl Scheduler {
         self.in_flight
             .values()
             .filter(move |f| ticks.is_some_and(|t| now >= f.since.saturating_add(t)))
+    }
+
+    /// Every resource's claims, by resource, each in the order they were
+    /// made, for a [snapshot](crate::snapshot).
+    pub(crate) fn claims(&self) -> Vec<(String, Vec<Claim>)> {
+        let mut claims: Vec<(String, Vec<Claim>)> = self
+            .claims
+            .iter()
+            .map(|(resource, claims)| (resource.clone(), claims.clone()))
+            .collect();
+        claims.sort_by(|a, b| a.0.cmp(&b.0));
+        claims
+    }
+
+    /// Take up what a [snapshot](crate::snapshot) kept, in place of what
+    /// is in flight and claimed, keeping the configuration. Fails, changing
+    /// nothing, unless it is a state the scheduler could be in: every
+    /// intent in flight under its own key with one open claim on its
+    /// resource, every open claim's intent in flight, and at most one wide
+    /// intent in flight.
+    pub(crate) fn restore(
+        &mut self,
+        in_flight: &[InFlight],
+        claims: &[(String, Vec<Claim>)],
+    ) -> Result<(), String> {
+        let mut flying = BTreeMap::new();
+        let mut per_resource: HashMap<String, usize> = HashMap::new();
+        let mut wide = None;
+        for f in in_flight {
+            let key = f.intent.key();
+            let resource = f.intent.action.resource().to_string();
+            if is_wide(f.intent.blast_radius) {
+                if wide.is_some() {
+                    return Err("two wide intents are in flight".into());
+                }
+                wide = Some(Wide {
+                    key: key.clone(),
+                    resource: resource.clone(),
+                    global: f.intent.blast_radius == BlastRadius::Global,
+                });
+            }
+            *per_resource.entry(resource).or_insert(0) += 1;
+            if flying.insert(key.clone(), f.clone()).is_some() {
+                return Err(format!("{key} is in flight twice"));
+            }
+        }
+        let mut open = 0;
+        let mut by_resource = HashMap::new();
+        for (resource, list) in claims {
+            if list.is_empty() || by_resource.contains_key(resource) {
+                return Err(format!(
+                    "the claims on {resource:?} are not ones a plane keeps"
+                ));
+            }
+            for claim in list.iter().filter(|c| c.done_at.is_none()) {
+                let fits = flying.get(&claim.key).is_some_and(|f: &InFlight| {
+                    f.intent.action == claim.action && f.intent.action.resource() == resource
+                });
+                if !fits {
+                    return Err(format!(
+                        "{} claims {resource:?} but is not in flight",
+                        claim.key
+                    ));
+                }
+                open += 1;
+            }
+            by_resource.insert(resource.clone(), list.clone());
+        }
+        if open != flying.len() {
+            return Err("an intent in flight has no claim on its resource".into());
+        }
+        self.in_flight = flying;
+        self.per_resource = per_resource;
+        self.wide = wide;
+        self.claims = by_resource;
+        Ok(())
     }
 }
 

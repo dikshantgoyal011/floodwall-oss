@@ -61,6 +61,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Plane snapshots (FW-709). `Floodwall::snapshot` captures, at a
+  checkpoint that covers every record, everything a replay would rebuild
+  that is not configuration: the queue in order (each intent's place and
+  the tick it joined), every agent's rate-limit bucket, what is in flight
+  and since when, each resource's conflict claims, what is held and why,
+  which held intents were released and by whom, the per-agent id marks,
+  the clock, the checkpoint itself and the label of the settings in force
+  (`Floodwall::with_settings_label`, or the latest `reconfigure`).
+  `Snapshot::to_json` / `Snapshot::from_json` give it a stable one-line
+  text form with a version and a SHA-256 digest; anything not written
+  exactly so is refused. `Floodwall::resume_from_snapshot` takes the state
+  up on a newly built plane, asks for the settings it names, and replays
+  only the ledger after the checkpoint, checked digest for digest like
+  `resume_with` (which now shares the same replay code), refusing a ledger
+  that does not start at the snapshot's checkpoint
+  (`ResumeError::Snapshot`). `Snapshot::read_tail` reads those lines.
+- `Ledger::starting_at` makes a ledger that starts at a checkpoint
+  instead of genesis: it holds only the records after it, appends,
+  cuts (signed) checkpoints and proves inclusion from the checkpoint's
+  Merkle frontier as the whole ledger would, verifies from the
+  checkpoint's head, and exports as a suffix export. `Ledger::size`
+  counts every record, before the checkpoint too; `Ledger::len` and
+  `Ledger::records` are about the records it holds. `Floodwall::resume`
+  refuses such a ledger with `ResumeError::NotFromGenesis`.
+- Host: `open` takes an optional `snapshot`, with `ledger` then holding
+  only the lines after it, and a `snapshot` op returns the plane's
+  snapshot at its most recent checkpoint, cutting one at the end of the
+  ledger first if records came after it (`null` before the first
+  checkpoint). `state` and `verify` count every record, before a snapshot
+  too.
 - Optional aging for low-priority work (FW-908).
   `SchedulerConfig::with_aging(Some(Aging::new(every, up_to)))` walks a
   waiting intent one priority higher for every `every` ticks it has waited
