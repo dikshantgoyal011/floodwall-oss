@@ -24,6 +24,11 @@
 //!   capped at the new burst.
 //! - Intents in flight stay in flight. Scheduling limits, the conflict
 //!   window, a lease and aging take their new values at the next pass.
+//!   Conflict claims already closed under the old window are dropped at
+//!   the change, so a wider window does not revive them.
+//! - Agents whose buckets are full under the old limit are forgotten at the
+//!   change (a full bucket and none are the same), so a bigger burst treats
+//!   them alike however lazily the plane had pruned.
 //! - Held intents stay held. A new TTL applies to each from the tick it was
 //!   held; a smaller capacity evicts nothing now, and only limits new holds.
 //!
@@ -109,6 +114,14 @@ impl Floodwall {
     ) -> Result<(), InvalidRateLimit> {
         settings.rate_limit.validate()?;
         let now = self.advance(now);
+        // State a plane drops lazily, in passes and checks that record
+        // nothing, is dropped here under the old settings first: a replay
+        // does not see those passes, and the new settings could otherwise
+        // make the dropped and the kept state rule differently. Claims
+        // closed under the old window, and rate-limit buckets already full
+        // under the old limit (a full bucket is the same as none), go.
+        self.scheduler.drop_closed_claims(now);
+        self.admission.prune_idle(now);
         self.apply_settings(settings);
         self.settings_label = Some(label.to_string());
         let tick = self.ledger.advance_clock(now);

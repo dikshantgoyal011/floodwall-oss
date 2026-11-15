@@ -80,12 +80,8 @@ struct Config {
     /// Whether the plane names the settings it starts with.
     labelled: bool,
     /// Per label: burst, refill, allowlist, in-flight limit, hold capacity,
-    /// TTL, lease and aging. The conflict window is the same for every
-    /// label: a plane resumed from its whole ledger does not see the passes
-    /// that recorded nothing, which drop claims a later, wider window would
-    /// still count, so it cannot follow a change of window.
+    /// TTL, lease, aging and conflict window.
     settings: Vec<Variant>,
-    window: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +95,7 @@ struct Variant {
     ttl: Option<u64>,
     lease: Option<Lease>,
     aging: Option<Aging>,
+    window: u64,
 }
 
 impl Variant {
@@ -119,6 +116,7 @@ impl Variant {
             ttl: *rng.pick(&[None, Some(0), Some(3), Some(15)]),
             lease: *rng.pick(&[None, None, Some(Lease::Report(2)), Some(Lease::Fail(3))]),
             aging: *rng.pick(&[None, None, Some(Aging::new(2, Priority::Urgent))]),
+            window: *rng.pick(&[0, 1, 5, 20]),
         }
     }
 }
@@ -132,7 +130,6 @@ impl Config {
             signer: rng.chance(30),
             labelled: rng.chance(50),
             settings: (0..LABELS.len()).map(|_| Variant::random(rng)).collect(),
-            window: *rng.pick(&[0, 1, 5, 20]),
         }
     }
 
@@ -150,7 +147,7 @@ impl Config {
             rate_limit: RateLimit::new(v.burst, v.refill),
             scheduler: SchedulerConfig::default()
                 .with_default_limit(v.default_limit)
-                .with_conflict_window(self.window)
+                .with_conflict_window(v.window)
                 .with_lease(v.lease)
                 .with_aging(v.aging),
             hold: HoldConfig::default()

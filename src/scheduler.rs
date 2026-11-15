@@ -449,12 +449,21 @@ impl Scheduler {
     /// Start a pass over the queue at tick `now`, first dropping claims
     /// whose window has closed.
     pub(crate) fn begin(&mut self, now: u64) -> Pass {
+        self.drop_closed_claims(now);
+        Pass::default()
+    }
+
+    /// Drop the claims whose window has closed at tick `now`. A pass does
+    /// this first; a change of settings does it too, under the old window,
+    /// so a wider window never revives a claim a live plane may already
+    /// have dropped in a pass that recorded nothing (and a replay never
+    /// sees).
+    pub(crate) fn drop_closed_claims(&mut self, now: u64) {
         let window = self.config.conflict_window;
         self.claims.retain(|_, claims| {
             claims.retain(|c| c.is_open(now, window));
             !claims.is_empty()
         });
-        Pass::default()
     }
 
     /// Whether another agent's contradictory change to `intent`'s resource
