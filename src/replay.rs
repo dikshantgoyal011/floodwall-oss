@@ -101,7 +101,10 @@
 //! later replay must reproduce it, but the restart that made the check
 //! happen is not; so while replaying, a signature check comes out as the
 //! ledger shows when it passed (every signature has just been checked),
-//! and when it failed, it must fail against the current keyring too.
+//! and when it failed, it must fail against the current keyring too. A
+//! decision past the ledger's last record, as when a call cut short is
+//! finished (see [Crashes](crate::replay#crashes)), is made now, so its
+//! check is made against the current keyring.
 //!
 //! What this establishes is that the agents asked for what the ledger
 //! says, and that this plane, so configured, makes the decisions it shows.
@@ -118,8 +121,11 @@
 //! [Durability](Floodwall#durability)), so a crash can leave only the first
 //! few on disk. The call never returned, so nothing acted on it. A replay
 //! reproduces those records, and since the call is deterministic, it
-//! finishes it: the rest of its records are written to the ledger exactly
-//! as the call would have written them. As after any restart, the caller
+//! finishes it: the rest of its records are written to the ledger as the
+//! call would have written them under the plane's configuration now. Those
+//! decisions are made now: under the current revision of each bundle and,
+//! for signatures, the current keyring, so a key rotated before the
+//! restart vouches for none of them. As after any restart, the caller
 //! then learns what is in flight from [`Floodwall::in_flight`], including
 //! anything admitted in that call. A call none of whose records reached the
 //! disk never happened, as far as the plane is concerned.
@@ -1364,6 +1370,58 @@ mod tests {
         // like any other change that changes a decision.
         let found = diverged_at_the_decision(bundled("fleet", "2", "\"api\"").resume(ledger(), 1));
         assert!(found.starts_with("wrote `defer` for a#1"), "{found}");
+    }
+
+    #[test]
+    fn a_resumed_plane_remembers_which_signed_ids_it_has_seen() {
+        // Audit lead: a restart must not reopen the door to a replay.
+        let mut before = plane();
+        let signed = scale("a", 7, "web", 2);
+        before.submit(signed.clone(), 0).unwrap();
+        before.tick(1);
+        before
+            .complete(&signed.key(), Outcome::Succeeded, 2)
+            .unwrap();
+        let mut after = plane().resume(reread(before.ledger()), 2).unwrap();
+        assert_eq!(after.submit(signed, 3), Err(Rejected::Duplicate));
+        assert_eq!(after.submit(scale("a", 8, "web", 2), 3), Ok(()));
+    }
+
+    #[test]
+    fn a_tick_cut_short_is_finished_under_the_current_keyring() {
+        // Audit lead: "a"'s key is rotated between a crash inside a tick and
+        // the restart. The decision the restart finishes is made now, so
+        // the retired key must not vouch for it.
+        let mut before = plane();
+        before.submit(scale("a", 1, "web", 2), 0).unwrap();
+        before.submit(scale("a", 2, "api", 2), 0).unwrap();
+        before.tick(1);
+        let records = before.ledger().records();
+        assert_eq!(records.len(), 4);
+        // A crash kept only the first of the tick's two decisions.
+        let cut = copy(&records[..records.len() - 1]);
+        let after = plane().with_keyring(rotated()).resume(cut, 1).unwrap();
+        let last = after.ledger().records().last().unwrap();
+        assert_eq!(last.intent.as_ref().unwrap().key(), IntentKey::new("a", 2));
+        assert!(last
+            .evidence
+            .policies
+            .iter()
+            .any(|(name, verdict)| name == SIGNATURE_CHECK && verdict == "reject"));
+        // Only a#1, whose admission reached the disk, is in flight.
+        let flying: Vec<_> = after.in_flight().map(|f| f.intent.key()).collect();
+        assert_eq!(flying, [IntentKey::new("a", 1)]);
+        assert!(after.ledger().verify());
+        // A later restart replays that rejection.
+        let again = plane()
+            .with_keyring(rotated())
+            .resume(reread(after.ledger()), 1)
+            .unwrap();
+        assert_eq!(state(&again), state(&after));
+        // Under an unchanged keyring the finished decision still admits.
+        let cut = copy(&records[..records.len() - 1]);
+        let same = plane().resume(cut, 1).unwrap();
+        assert_eq!(same.in_flight().count(), 2);
     }
 
     #[test]
