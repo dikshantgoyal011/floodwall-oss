@@ -50,7 +50,7 @@ jobs:
           node tools/verify-ledger.mjs target/export-fixture/edge-suffix.jsonl target/export-fixture/keys.json
           node tools/verify-ledger.mjs target/export-fixture/durable.jsonl target/export-fixture/keys.json
           cmp target/export-fixture/edge.jsonl target/export-fixture/durable.jsonl
-          node --test tools/verify-ledger.test.mjs
+          node --test tools/verify-ledger.test.mjs tools/deploybot.test.mjs
   frontend:
     runs-on: ubuntu-latest
     steps:
