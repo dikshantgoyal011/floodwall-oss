@@ -221,6 +221,22 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(fw.intent({**SCALE, "id": 5})["id"], "5")
         self.assertEqual(fw._last_id, 0)
 
+    def test_retry_after_is_waited_out_for_a_minute_at_most(self):
+        for header, expected in (("3600", 60.0), ("Wed, 21 Oct 2099 07:28:00 GMT", 60.0), ("2", 2.0)):
+            tries = []
+            slept = []
+
+            def opener(request, timeout, header=header):
+                tries.append(1)
+                if len(tries) < 2:
+                    raise urllib.error.HTTPError(request.full_url, 429, "slow", {"Retry-After": header}, io.BytesIO(b"{}"))
+                return Answer(b'{"verdict":"admit"}')
+
+            fw = client(opener)
+            fw._sleep = slept.append
+            fw.submit(SCALE)
+            self.assertEqual(slept, [expected], header)
+
     def test_retry_after_may_be_a_date_or_garbage(self):
         for header in ("Wed, 21 Oct 2099 07:28:00 GMT", "soon", "", "nan", "-5"):
             tries = []

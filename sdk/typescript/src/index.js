@@ -11,6 +11,8 @@ const BLAST_RADII = ["cell", "service", "region", "global"];
 const WAITING = new Set(["queued", "held"]);
 /** Polls of a waiting intent are never closer together than this, whatever the server does. */
 const MIN_POLL_MS = 1000;
+/** A 429's Retry-After is waited out up to this, however long it asks for. */
+const MAX_RETRY_AFTER_SECONDS = 60;
 const MAX_REASON = 1024;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -238,11 +240,13 @@ export class Floodwall {
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
+        // A redirect is an error: the API key must not follow a response to another place.
+        redirect: "error",
       });
-      // Rate limited or the queue is full: wait as told, a few times.
+      // Rate limited or the queue is full: wait as told (a minute at most), a few times.
       if (response.status === 429 && attempt < 5) {
         const seconds = Number(response.headers.get("Retry-After")) || 1;
-        await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+        await this.sleep(Math.min(Math.max(seconds, 0), MAX_RETRY_AFTER_SECONDS) * 1000);
         continue;
       }
       break;

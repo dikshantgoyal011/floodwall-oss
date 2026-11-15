@@ -63,6 +63,10 @@ class NotAdmitted(Exception):
         self.decision = decision
 
 
+# A 429's Retry-After is waited out up to this, however long it asks for.
+_MAX_RETRY_AFTER_SECONDS = 60.0
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is an error: the API key must not follow a response to another place."""
 
@@ -283,7 +287,7 @@ def _unreachable(error: BaseException) -> bool:
 
 
 def _retry_after(value: Any) -> float:
-    """Seconds to wait from a Retry-After header, given as seconds or an HTTP date; 1 s if unusable."""
+    """Seconds to wait from a Retry-After header, given as seconds or an HTTP date; 1 s if unusable, 60 s at most."""
     try:
         text = str(value).strip()
         try:
@@ -293,7 +297,7 @@ def _retry_after(value: Any) -> float:
             if when.tzinfo is None:
                 when = when.replace(tzinfo=datetime.timezone.utc)
             seconds = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-        return max(0.0, seconds) if math.isfinite(seconds) else 1.0
+        return min(max(0.0, seconds), _MAX_RETRY_AFTER_SECONDS) if math.isfinite(seconds) else 1.0
     except Exception:  # noqa: BLE001 - a bad header must not crash the client
         return 1.0
 

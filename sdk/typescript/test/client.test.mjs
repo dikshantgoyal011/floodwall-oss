@@ -6,7 +6,7 @@ import { Floodwall, FloodwallError, NotAdmitted, intentBytes } from "../src/inde
 function stub(handler) {
   const calls = [];
   const fetch = async (url, init) => {
-    const call = { url: new URL(url), method: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : undefined };
+    const call = { url: new URL(url), method: init.method, headers: init.headers, redirect: init.redirect, body: init.body ? JSON.parse(init.body) : undefined };
     calls.push(call);
     const [status, body, headers] = await handler(call);
     return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
@@ -170,6 +170,15 @@ test("wait never polls faster than once a second", async () => {
   assert.equal(status.status, "in_flight");
   assert.equal(sleeps.length, 3);
   for (const ms of sleeps) assert.ok(ms > 900 && ms <= 1000, `slept ${ms}`);
+});
+
+test("a redirect is an error, and a 429's Retry-After is waited out for a minute at most", async () => {
+  let tries = 0;
+  const sleeps = [];
+  const s = stub(async () => (++tries < 3 ? [429, { error: "slow" }, { "Retry-After": tries === 1 ? "3600" : "2" }] : [200, { verdict: "admit" }]));
+  await client(s.fetch, { sleep: async (ms) => sleeps.push(ms) }).submit({ action: { kind: "scale", resource: "web", replicas: 3 } });
+  assert.deepEqual(sleeps, [60_000, 2000]);
+  assert.ok(s.calls.every((c) => c.redirect === "error"));
 });
 
 test("a failed report never masks the change's own error", async () => {
