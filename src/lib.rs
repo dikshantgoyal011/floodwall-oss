@@ -80,7 +80,7 @@ pub mod sha512;
 pub mod stats;
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 pub use admission::{Admission, InvalidRateLimit, RateLimit, Rejected};
@@ -101,6 +101,7 @@ pub use stats::{Counts, Stats};
 
 use admission::QueueKey;
 use hold::Hold;
+use intent::AgentId;
 use scheduler::{Readiness, Scheduler};
 use stats::{Counters, Event};
 
@@ -251,12 +252,19 @@ pub struct Floodwall {
     /// them. Their deferrals are waived when they are next ruled on.
     released: HashMap<IntentKey, String>,
     /// Every intent that is queued, in flight, or held. An intent key can
-    /// only be live once, so a resubmitted duplicate is refused.
+    /// only be live once, so a resubmitted duplicate is refused. (With a
+    /// keyring, [`Floodwall::submit`] also refuses ids below an agent's
+    /// mark, `signed_ids`.)
     live: HashSet<IntentKey>,
     /// With a keyring, every intent must be signed by its agent's key.
     keyring: Option<Keyring>,
     /// Live intents already checked against the current keyring.
     authenticated: HashSet<IntentKey>,
+    /// With a keyring: the highest id queued for each of its agents. Ids
+    /// are monotonic per agent, so a signed intent whose id is not above
+    /// its agent's mark is a replay and is refused (see
+    /// [`Floodwall::submit`]). One entry per agent the keyring vouched for.
+    signed_ids: BTreeMap<AgentId, u64>,
     /// While [`Floodwall::resume`] replays a pass: for each intent the
     /// ledger shows that pass ruling on, whether its signature check
     /// passed (see [`crate::replay`]).
@@ -317,6 +325,7 @@ impl Floodwall {
             live,
             keyring: None,
             authenticated: HashSet::new(),
+            signed_ids: BTreeMap::new(),
             replayed_checks: None,
             replayed_bundles: None,
         })
@@ -332,7 +341,30 @@ impl Floodwall {
     /// shows in the breakdown as [`SIGNATURE_CHECK`]. Ledger records carry
     /// each intent's signature, so [`Ledger::verify_signatures`] can prove
     /// authorship later.
+    ///
+    /// Ids are monotonic per agent: once an intent is queued, the plane
+    /// refuses any later signed intent from the same agent whose id is not
+    /// above it, with [`Rejected::Duplicate`], so a signed intent copied
+    /// from this plane's ledger or an export of it cannot be submitted
+    /// again, here or on a plane resumed from that ledger. A plane started
+    /// on a new ledger knows nothing of the old one's ids: give agents new
+    /// keys when you start one. Changing the keyring keeps what the plane
+    /// knows; intents already live and signed by their agent's key on the
+    /// new keyring count too.
     pub fn with_keyring(mut self, keyring: Keyring) -> Self {
+        let live = self
+            .admission
+            .waiting()
+            .chain(self.scheduler.in_flight().map(|f| &f.intent))
+            .chain(self.hold.iter().map(|h| &h.intent));
+        for intent in live {
+            // Only an intent its agent signed may raise the agent's mark: an
+            // adopted forgery must not lock the agent out.
+            if keyring.authenticate(intent).is_ok() {
+                let mark = self.signed_ids.entry(intent.agent.clone()).or_insert(0);
+                *mark = (*mark).max(intent.id);
+            }
+        }
         self.keyring = Some(keyring);
         self.authenticated.clear();
         self
@@ -384,7 +416,10 @@ impl Floodwall {
     /// nothing about the queue and cannot spend an agent's rate allowance.
     /// Then an intent whose [`IntentKey`] is already queued, in flight or
     /// held is refused with [`Rejected::Duplicate`], before the rate limit
-    /// is touched. Last, admission may refuse it with
+    /// is touched. With a keyring, so is a signed intent whose id is not
+    /// above the highest id the plane has queued for its agent: ids are
+    /// monotonic per agent, so this is a replay of signed bytes the agent
+    /// sent before, even if that intent is done and forgotten. Last, admission may refuse it with
     /// [`Rejected::Backpressure`] or [`Rejected::RateLimited`].
     ///
     /// An intent that gets in is recorded in the ledger as `queued`, so it
@@ -407,6 +442,11 @@ impl Floodwall {
             }),
             None => Ok(()),
         }
+        .and_then(|()| match self.signed_ids.get(&intent.agent) {
+            // Only a keyring sets marks, and only for its own agents.
+            Some(&mark) if self.keyring.is_some() && intent.id <= mark => Err(Rejected::Duplicate),
+            _ => Ok(()),
+        })
         .and_then(|()| self.queue(intent, now));
         match result {
             Ok(()) => {
@@ -438,6 +478,10 @@ impl Floodwall {
         self.admission.submit(intent.clone(), now)?;
         if self.keyring.is_some() {
             self.authenticated.insert(key.clone());
+            // A replay rebuilds the marks from the queued records, without
+            // refusing any: history may predate them.
+            let mark = self.signed_ids.entry(intent.agent.clone()).or_insert(0);
+            *mark = (*mark).max(intent.id);
         }
         self.live.insert(key);
         self.record(&intent, QUEUED, None, Vec::new(), Vec::new());
@@ -586,7 +630,14 @@ impl Floodwall {
                     Ok(()) => Verdict::Admit,
                     Err(e) => Verdict::Reject(e.to_string()),
                 },
-                None if self.authenticated.contains(&key) => Verdict::Admit,
+                // Checked against this keyring already. Not while resume
+                // replays a pass: a decision past what the ledger shows is
+                // made now (see crate::replay#crashes), and what vouched for
+                // the intent in the past (a retired key) is not permission
+                // now.
+                None if self.replayed_checks.is_none() && self.authenticated.contains(&key) => {
+                    Verdict::Admit
+                }
                 None => match keyring.authenticate(&intent) {
                     Ok(()) => {
                         self.authenticated.insert(key.clone());
@@ -727,7 +778,8 @@ impl Floodwall {
 
     /// Drop a held intent at logical time `now`, on the authority of `by`
     /// (recorded in the ledger), and return it. Its key may then be
-    /// submitted again.
+    /// submitted again, on a plane without a keyring; with one, ids are
+    /// monotonic per agent, so send it again under a new id.
     ///
     /// # Panics
     ///
@@ -1971,6 +2023,72 @@ mod tests {
         // Nothing reached the queue or the ledger.
         assert_eq!(p.pending(), 0);
         assert!(p.ledger().is_empty());
+    }
+
+    #[test]
+    fn changing_the_keyring_keeps_the_signed_ids_seen() {
+        let mut p = signed_plane();
+        let done = scale(1, "web").signed(&bot_key());
+        p.submit(done.clone(), 0).unwrap();
+        p.tick(0);
+        p.complete(&done.key(), Outcome::Succeeded, 1).unwrap();
+        // In flight when the keyring changes.
+        let flying = scale(5, "api").signed(&bot_key());
+        p.submit(flying.clone(), 1).unwrap();
+        p.tick(1);
+        let mut p = p.with_keyring(keyring());
+        assert_eq!(p.submit(done, 2), Err(Rejected::Duplicate));
+        p.complete(&flying.key(), Outcome::Succeeded, 3).unwrap();
+        assert_eq!(p.submit(flying, 4), Err(Rejected::Duplicate));
+        assert_eq!(p.submit(scale(6, "web").signed(&bot_key()), 4), Ok(()));
+    }
+
+    #[test]
+    fn an_adopted_forgery_does_not_lock_its_agent_out() {
+        let mut admission = Admission::new(16, RateLimit::new(5.0, 1.0));
+        admission
+            .submit(scale(u64::MAX, "web").signed(&other_key()), 0)
+            .unwrap();
+        let mut p = Floodwall::new(admission, Gate::new()).with_keyring(keyring());
+        assert!(matches!(p.tick(0).decisions[0].verdict, Verdict::Reject(_)));
+        assert_eq!(p.submit(scale(1, "web").signed(&bot_key()), 1), Ok(()));
+    }
+
+    #[test]
+    fn a_signed_intent_cannot_be_replayed_once_it_is_done() {
+        // Audit lead: the same signed bytes, taken from the ledger after the
+        // intent completed, must not run a second time in bot's name.
+        let mut p = signed_plane();
+        let signed = scale(1, "web").signed(&bot_key());
+        p.submit(signed.clone(), 0).unwrap();
+        assert_eq!(verdicts(&p.tick(0)), ["admit"]);
+        p.complete(&signed.key(), Outcome::Succeeded, 1).unwrap();
+        assert_eq!(p.submit(signed.clone(), 2), Err(Rejected::Duplicate));
+        assert!(p.tick(2).decisions.is_empty());
+        // Nor an older id, nor one rejected by the gate.
+        assert_eq!(
+            p.submit(scale(0, "web").signed(&bot_key()), 2),
+            Err(Rejected::Duplicate)
+        );
+        let mut global = scale(2, "web");
+        global.blast_radius = BlastRadius::Global;
+        let global = global.signed(&bot_key());
+        p.submit(global.clone(), 3).unwrap();
+        assert!(matches!(p.tick(3).decisions[0].verdict, Verdict::Reject(_)));
+        assert_eq!(p.submit(global, 4), Err(Rejected::Duplicate));
+        // The next id goes through; other agents keep their own ids.
+        p.submit(scale(3, "web").signed(&bot_key()), 5).unwrap();
+        let mut theirs = scale(1, "api");
+        theirs.agent = AgentId::new("other");
+        p.submit(theirs.signed(&other_key()), 5).unwrap();
+        // A refusal at the door does not use up the id: a rate-limited
+        // intent may be sent again.
+        let admission = Admission::new(16, RateLimit::new(1.0, 1.0));
+        let mut q = Floodwall::new(admission, Gate::new()).with_keyring(keyring());
+        q.submit(scale(1, "web").signed(&bot_key()), 0).unwrap();
+        let next = scale(2, "web").signed(&bot_key());
+        assert_eq!(q.submit(next.clone(), 0), Err(Rejected::RateLimited));
+        assert_eq!(q.submit(next, 1), Ok(()));
     }
 
     #[test]

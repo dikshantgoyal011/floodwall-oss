@@ -286,6 +286,8 @@ struct Coverage {
     /// Resubmissions refused because the key was an adopted intent's.
     adopted_duplicates_refused: usize,
     forgeries_refused: usize,
+    /// Signed resubmissions of a done intent's id, refused as replays.
+    replays_refused: usize,
     signed_records: usize,
     suffix_audits: usize,
     inclusion_proofs: usize,
@@ -381,6 +383,9 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
     let mut admission = Admission::new(QUEUE_CAPACITY, RateLimit::new(6.0, 2.0));
     let mut model = Model::default();
     let mut next_id: HashMap<&str, u64> = HashMap::new();
+    // With a keyring, ids are monotonic per agent: the highest id queued
+    // for each agent, below which a signed intent is a replay.
+    let mut marks: HashMap<&str, u64> = HashMap::new();
     // Half the seeds build the plane around an Admission that already has
     // work queued and has seen time pass.
     let start = if rng.chance(50) {
@@ -399,6 +404,8 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
             let key = intent.key();
             if admission.submit(intent.clone(), start).is_ok() {
                 cov.adopted += 1;
+                let mark = marks.entry(agent).or_insert(0);
+                *mark = (*mark).max(*id);
                 model.live.insert(key.clone());
                 model.queue.push((intent, start));
                 adopted.insert(key);
@@ -472,6 +479,14 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
                 }
                 match result {
                     Ok(()) => {
+                        if signed {
+                            assert!(
+                                marks.get(agent).is_none_or(|&m| id > m),
+                                "seed {seed}: accepted a replayed id"
+                            );
+                            let mark = marks.entry(agent).or_insert(id);
+                            *mark = (*mark).max(id);
+                        }
                         assert!(model.live.insert(key), "seed {seed}: accepted a live key");
                         model.queue.push((intent, now));
                         model.arrivals += 1;
@@ -481,7 +496,14 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
                         if adopted.contains(&key) {
                             cov.adopted_duplicates_refused += 1;
                         }
-                        assert!(model.live.contains(&key), "seed {seed}: false duplicate")
+                        let replay = signed && marks.get(agent).is_some_and(|&m| id <= m);
+                        if replay && !model.live.contains(&key) {
+                            cov.replays_refused += 1;
+                        }
+                        assert!(
+                            model.live.contains(&key) || replay,
+                            "seed {seed}: false duplicate"
+                        )
                     }
                     Err(Rejected::RateLimited | Rejected::Backpressure) => {}
                     Err(
@@ -842,6 +864,7 @@ fn signed_floods_keep_every_record_attributable() {
     }
     eprintln!("{cov:#?}");
     assert!(cov.forgeries_refused > 10, "{cov:?}");
+    assert!(cov.replays_refused > 0, "{cov:?}");
     assert!(cov.signed_records > 500, "{cov:?}");
     assert!(
         cov.released > 0 && cov.expired_by_tick + cov.expired_by_human > 0,

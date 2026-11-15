@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for clients that reuse or reorder ids:** on a plane with a
+  keyring, `Rejected::Duplicate` now also means "this id is not above the
+  highest id already queued for the agent", and such an intent will never
+  run. Before, it only meant the same key was still live, and clients
+  could treat it as already queued. Agents must give each signed intent a
+  higher id than the last, including when retrying one the plane rejected
+  or expired. Ids refused at the door (rate limit, backpressure) may be
+  sent again.
+
+### Security
+
+- A signed intent can no longer be submitted twice. With a keyring, ids
+  are now monotonic per agent, as `Intent::id` always documented: once an
+  intent is queued, `Floodwall::submit` refuses any later signed intent
+  from the same agent whose id is not above it, with `Rejected::Duplicate`.
+  Before, the same signed bytes (copied from a ledger or an export, say)
+  could be submitted again once the original was completed, rejected,
+  lapsed or expired, and ran again in the agent's name. A refusal at the
+  door (rate limit, backpressure) does not use up the id. `resume` rebuilds
+  each agent's highest id from the ledger, and changing the keyring keeps
+  it. The marks live with a plane and its ledger: a plane started on a new
+  ledger does not know the old one's ids, so give agents new keys when you
+  start one.
+- `Floodwall::resume` no longer lets a retired key vouch for a decision it
+  finishes. When a tick was cut short by a crash and the agent's key was
+  rotated before the restart, the decisions the restart wrote past the end
+  of the stored ledger trusted the signature check done against the
+  history's keys, retired ones included, and could admit an intent signed
+  only with the retired key. They are now checked against the current
+  keyring, like any decision made after a restart.
+
 ### Added
 
 - Optional aging for low-priority work (FW-908).

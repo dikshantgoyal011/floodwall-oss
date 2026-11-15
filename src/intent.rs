@@ -159,7 +159,10 @@ pub enum Priority {
 /// The signature is Ed25519 over the 32 digest bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
-    /// Author-assigned id, monotonic per agent.
+    /// Author-assigned id, monotonic per agent. A plane with a keyring
+    /// enforces this: it refuses a signed intent whose id is not above the
+    /// highest it has queued for the agent, so signed bytes cannot be
+    /// replayed on that plane or one resumed from its ledger.
     pub id: u64,
     /// Who proposed it.
     pub agent: AgentId,
