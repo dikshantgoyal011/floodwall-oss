@@ -105,3 +105,116 @@ test("the signed bytes match the crate's encoding", () => {
     field("floodwall/intent/v1") + field("a") + "0700000000000000" + "01" + field("w") + "02000000" + "02" + "02";
   assert.equal(hex, expected);
 });
+
+const SCALE = { action: { kind: "scale", resource: "web", replicas: 1 } };
+const isIntents = (call) => call.method === "POST" && call.url.pathname.endsWith("/intents");
+
+test("fail-open covers only transport failures and 5xx, never the caller's own errors", async () => {
+  const seen = [];
+  const calls = [];
+  const down = async () => {
+    calls.push(1);
+    throw new TypeError("fetch failed");
+  };
+  const open = (fetch) => client(fetch, { whenUnreachable: "open", onFailOpen: (i) => seen.push(i) });
+  // Validation errors throw, without a request and without applying.
+  await assert.rejects(open(down).guard({ ...SCALE, priority: "nope" }, () => assert.fail("applied")), /priority must be/);
+  await assert.rejects(open(down).guard({ action: { kind: "scale", resource: "web", replicas: -1 } }, () => assert.fail("applied")), /replicas/);
+  // A signing error throws too.
+  const badKey = client(down, { whenUnreachable: "open", signingKey: new Uint8Array(5) });
+  await assert.rejects(badKey.guard(SCALE, () => assert.fail("applied")), /32 bytes/);
+  assert.equal(calls.length, 0);
+  assert.equal(seen.length, 0);
+  // An unknown error from fetch is not "unreachable".
+  const weird = async () => {
+    throw new Error("boom");
+  };
+  await assert.rejects(open(weird).guard(SCALE, () => assert.fail("applied")), /boom/);
+  // Timeouts and aborts and 5xx are.
+  for (const name of ["AbortError", "TimeoutError"]) {
+    const aborted = async () => {
+      throw Object.assign(new Error("slow"), { name });
+    };
+    assert.equal(await open(aborted).guard(SCALE, () => "ran"), "ran");
+  }
+  const s = stub(async () => [503, { error: "down" }]);
+  assert.equal(await open(s.fetch).guard(SCALE, () => "ran"), "ran");
+  assert.equal(seen.length, 3);
+});
+
+test("the default fail-open log leaves the manifest out", async () => {
+  const lines = [];
+  const warn = console.warn;
+  console.warn = (...a) => lines.push(a.join(" "));
+  try {
+    const down = async () => {
+      throw new TypeError("fetch failed");
+    };
+    await client(down, { whenUnreachable: "open" }).guard({ action: { kind: "apply", resource: "web", manifest: "SECRET: hunter2" } }, () => 1);
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /deployer/);
+  assert.match(lines[0], /apply/);
+  assert.match(lines[0], /web/);
+  assert.doesNotMatch(lines[0], /hunter2/);
+});
+
+test("wait never polls faster than once a second", async () => {
+  let polls = 0;
+  const sleeps = [];
+  const s = stub(async () => [200, { status: ++polls < 4 ? "held" : "in_flight" }]);
+  const c = client(s.fetch, { sleep: async (ms) => sleeps.push(ms) });
+  const status = await c.wait({ agent: "deployer", id: "1" });
+  assert.equal(status.status, "in_flight");
+  assert.equal(sleeps.length, 3);
+  for (const ms of sleeps) assert.ok(ms > 900 && ms <= 1000, `slept ${ms}`);
+});
+
+test("a failed report never masks the change's own error", async () => {
+  const s = stub(async (call) => (isIntents(call) ? [200, { verdict: "admit" }] : [500, { error: "report down" }]));
+  const err = new Error("kubectl exploded");
+  await assert.rejects(client(s.fetch).guard(SCALE, () => { throw err; }), (e) => e === err && e.reportError?.status === 500);
+});
+
+test("a failed report after success returns the result and tells onReportError", async () => {
+  const s = stub(async (call) => (isIntents(call) ? [200, { verdict: "admit" }] : [500, { error: "report down" }]));
+  const told = [];
+  const result = await client(s.fetch, { onReportError: (e, key) => told.push([e, key]) }).guard(SCALE, () => "applied");
+  assert.equal(result, "applied");
+  assert.equal(told.length, 1);
+  assert.equal(told[0][0].status, 500);
+  assert.equal(told[0][1].agent, "deployer");
+  // The default warns, without the manifest.
+  const lines = [];
+  const warn = console.warn;
+  console.warn = (...a) => lines.push(a.join(" "));
+  try {
+    assert.equal(await client(s.fetch).guard({ action: { kind: "apply", resource: "web", manifest: "SECRET" } }, () => "ok"), "ok");
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(lines.length, 1);
+  assert.doesNotMatch(lines[0], /SECRET/);
+});
+
+test("failure reasons are collapsed to single spaces and capped at 1024", async () => {
+  const s = stub(async (call) => (isIntents(call) ? [200, { verdict: "admit" }] : [200, {}]));
+  await assert.rejects(client(s.fetch).guard(SCALE, () => { throw new Error("a\n\n  b\tc " + "x".repeat(3000)); }));
+  const reason = s.calls.at(-1).body.reason;
+  assert.ok(reason.startsWith("a b c xxx"));
+  assert.equal(reason.length, 1024);
+});
+
+test("baseUrl must be https unless local; the key stays out of logs", () => {
+  const f = async () => {};
+  for (const baseUrl of ["http://api.example.com", "ftp://x", "not a url"]) {
+    assert.throws(() => client(f, { baseUrl }), TypeError);
+  }
+  for (const baseUrl of ["https://api.example.com/", "http://localhost:8787", "http://127.0.0.1:1", "http://[::1]:3"]) client(f, { baseUrl });
+  const c = client(f);
+  assert.ok(!JSON.stringify(c).includes("fw_test_x"));
+  assert.ok(!Object.keys(c).includes("apiKey"));
+  assert.equal(c.apiKey, "fw_test_x");
+});

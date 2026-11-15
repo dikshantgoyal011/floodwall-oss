@@ -44,11 +44,17 @@ export interface FloodwallOptions {
   apiKey: string;
   plane: string;
   agent: string;
+  /** Must be https:// unless the host is localhost, 127.0.0.1 or [::1]. */
   baseUrl?: string;
   whenUnreachable?: "closed" | "open";
-  onFailOpen?: (change: Change | Intent, error: unknown) => void;
+  /** Told about each change applied unchecked. The default logs agent, kind, resource and error, never the manifest. */
+  onFailOpen?: (intent: Intent, error: unknown) => void;
   signingKey?: CryptoKey | Uint8Array;
+  /** Told when reporting a successful change failed; the result is still returned. Defaults to console.warn. */
+  onReportError?: (error: unknown, key: IntentKey) => void;
   fetch?: typeof fetch;
+  /** For tests: how `wait` pauses between polls. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export declare class Floodwall {
@@ -58,9 +64,15 @@ export declare class Floodwall {
   submit(change: Change | Intent): Promise<Decision>;
   wait(key: IntentKey, options?: { timeoutSeconds?: number }): Promise<Decision>;
   report(key: IntentKey, outcome: "succeeded" | "failed", reason?: string): Promise<void>;
+  prepare(change: Change | Intent): Promise<Intent>;
+  /** If `apply` throws and the failure report fails too, the apply error is thrown with `reportError` set. */
   guard<T>(change: Change | Intent, apply: () => T | Promise<T>, options?: { timeoutSeconds?: number }): Promise<T>;
 }
 
+/**
+ * When `decision.status` is "held" after a timeout, the intent is still held and may be released later:
+ * do not apply the change afterwards without submitting it again.
+ */
 export declare class NotAdmitted extends Error {
   decision: Decision;
 }

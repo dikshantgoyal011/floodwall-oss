@@ -9,8 +9,16 @@ const PRIORITIES = ["bulk", "normal", "urgent", "pager"];
 const BLAST_RADII = ["cell", "service", "region", "global"];
 /** Statuses an intent can still leave without anyone acting on it. */
 const WAITING = new Set(["queued", "held"]);
+/** Polls of a waiting intent are never closer together than this, whatever the server does. */
+const MIN_POLL_MS = 1000;
+const MAX_REASON = 1024;
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-/** The plane did not admit the change: it was rejected, expired or lapsed, or still waited when time ran out. */
+/**
+ * The plane did not admit the change: it was rejected, expired or lapsed, or still waited when time ran out.
+ * When `decision.status` is "held" (or "queued") after a timeout, the intent is still held on the plane and
+ * may be released later. The agent must not apply the change afterwards without submitting it again.
+ */
 export class NotAdmitted extends Error {
   constructor(decision) {
     super(
@@ -46,23 +54,39 @@ export class FloodwallError extends Error {
  * @param {(intent: object, error: Error) => void} [options.onFailOpen] Told about each change applied unchecked.
  * @param {CryptoKey|Uint8Array} [options.signingKey] The agent's Ed25519 private key (or its 32-byte seed),
  *   for planes that require signed intents.
+ * @param {(error: Error, key: {agent: string, id: string}) => void} [options.onReportError] Told when reporting
+ *   a successful change failed (the result is still returned). Defaults to a console.warn without the manifest.
  * @param {typeof fetch} [options.fetch] For tests.
+ * @param {(ms: number) => Promise<void>} [options.sleep] For tests.
+ *
+ * `baseUrl` must be https:// unless the host is localhost, 127.0.0.1 or [::1].
  */
 export class Floodwall {
   constructor(options) {
     for (const name of ["apiKey", "plane", "agent"]) {
       if (typeof options?.[name] !== "string" || !options[name]) throw new TypeError(`${name} is required`);
     }
-    this.apiKey = options.apiKey;
+    // Not enumerable, so logging or serializing the client does not print the key.
+    Object.defineProperty(this, "apiKey", { value: options.apiKey, enumerable: false, writable: true, configurable: true });
     this.plane = options.plane;
     this.agent = options.agent;
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    checkBaseUrl(this.baseUrl);
     this.whenUnreachable = options.whenUnreachable ?? "closed";
     if (this.whenUnreachable !== "closed" && this.whenUnreachable !== "open") {
       throw new TypeError('whenUnreachable must be "closed" or "open"');
     }
-    this.onFailOpen = options.onFailOpen ?? ((intent, error) => console.warn("floodwall unreachable; applied unchecked", intent, error));
-    this.signingKey = options.signingKey;
+    this.onFailOpen =
+      options.onFailOpen ??
+      ((intent, error) =>
+        console.warn(
+          `floodwall unreachable; applied unchecked: agent=${intent.agent} kind=${intent.action?.kind} resource=${intent.action?.resource}: ${error?.message ?? error}`,
+        ));
+    this.onReportError =
+      options.onReportError ??
+      ((error, key) => console.warn(`floodwall could not report the outcome of ${key.agent}/${key.id}: ${error?.message ?? error}`));
+    Object.defineProperty(this, "signingKey", { value: options.signingKey, enumerable: false, writable: true, configurable: true });
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.lastId = 0;
   }
@@ -110,22 +134,33 @@ export class Floodwall {
     };
   }
 
-  /** Offer a change. Resolves to the plane's first answer: admit, defer (held), reject, or queued. */
-  async submit(change) {
+  /** Validate (and sign, when there is a key) a change: errors here are the caller's, never "unreachable". */
+  async prepare(change) {
     const intent = "agent" in change && "blast_radius" in change ? change : this.intent(change);
     if (this.signingKey) intent.signature = await sign(intent, this.signingKey);
+    return intent;
+  }
+
+  /** Offer a change. Resolves to the plane's first answer: admit, defer (held), reject, or queued. */
+  async submit(change) {
+    return this.post(await this.prepare(change));
+  }
+
+  async post(intent) {
     const answer = await this.request("POST", `/v1/planes/${enc(this.plane)}/intents`, intent);
     return decision(answer, intent);
   }
 
   /**
    * Wait until the intent leaves the queue and the hold queue (it is admitted, rejected, expired or lapsed),
-   * or `timeoutSeconds` pass. Resolves to its latest status either way.
+   * or `timeoutSeconds` pass. Resolves to its latest status either way. A timeout leaves the intent held.
+   * Polls are at least a second apart even if the server answers at once.
    */
   async wait(key, { timeoutSeconds = 300 } = {}) {
     const until = Date.now() + timeoutSeconds * 1000;
     for (;;) {
-      const left = Math.ceil((until - Date.now()) / 1000);
+      const started = Date.now();
+      const left = Math.ceil((until - started) / 1000);
       const wait = Math.max(0, Math.min(20, left));
       const answer = await this.request(
         "GET",
@@ -133,6 +168,8 @@ export class Floodwall {
       );
       const status = decision(answer, null, key);
       if (!WAITING.has(status.status) || left <= 0) return status;
+      const pause = Math.min(MIN_POLL_MS - (Date.now() - started), until - Date.now());
+      if (pause > 0) await this.sleep(pause);
     }
   }
 
@@ -142,21 +179,26 @@ export class Floodwall {
     await this.request(
       "POST",
       `/v1/planes/${enc(this.plane)}/intents/${enc(key.agent)}/${enc(key.id)}/outcome`,
-      { outcome, reason: reason ?? null },
+      { outcome, reason: reason == null ? null : String(reason).replace(/\s+/g, " ").trim().slice(0, MAX_REASON) },
     );
   }
 
   /**
    * Run `apply` only if the plane admits the change, and report the outcome, failures included.
-   * Throws NotAdmitted when it is not admitted; rethrows what `apply` throws after reporting it failed.
+   * Throws NotAdmitted when it is not admitted (a "held" intent after a timeout may still be released later;
+   * do not apply the change then without submitting it again). Rethrows what `apply` throws after reporting it
+   * failed; if that report fails too, the apply error is still the one thrown, with the report error on its
+   * `reportError` property. If `apply` succeeds but the report fails, the result is returned and `onReportError` told.
+   * Only transport failures and 5xx count as unreachable; invalid changes and signing errors always throw.
    */
   async guard(change, apply, { timeoutSeconds = 300 } = {}) {
+    const intent = await this.prepare(change);
     let first;
     try {
-      first = await this.submit(change);
+      first = await this.post(intent);
     } catch (error) {
       if (this.whenUnreachable === "open" && unreachable(error)) {
-        this.onFailOpen(change, error);
+        this.onFailOpen(intent, error);
         return apply();
       }
       throw error;
@@ -167,10 +209,22 @@ export class Floodwall {
     try {
       result = await apply();
     } catch (error) {
-      await this.report(first.key, "failed", String(error?.message ?? error).slice(0, 500));
+      try {
+        await this.report(first.key, "failed", String(error?.message ?? error));
+      } catch (reportError) {
+        try {
+          Object.defineProperty(error, "reportError", { value: reportError, enumerable: false, configurable: true, writable: true });
+        } catch {
+          // A thrown primitive or frozen object cannot carry it; the apply error still wins.
+        }
+      }
       throw error;
     }
-    await this.report(first.key, "succeeded");
+    try {
+      await this.report(first.key, "succeeded");
+    } catch (reportError) {
+      this.onReportError(reportError, first.key);
+    }
     return result;
   }
 
@@ -211,8 +265,22 @@ function enc(value) {
   return encodeURIComponent(String(value));
 }
 
+/** Only a transport failure (fetch's TypeError, an abort or timeout) or a 5xx means the plane is unreachable. */
 function unreachable(error) {
-  return !(error instanceof FloodwallError) || error.status >= 500;
+  if (error instanceof FloodwallError) return error.status >= 500;
+  return error instanceof TypeError || error?.name === "AbortError" || error?.name === "TimeoutError";
+}
+
+function checkBaseUrl(baseUrl) {
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new TypeError("baseUrl must be an absolute URL");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOCAL_HOSTS.has(url.hostname))) {
+    throw new TypeError("baseUrl must be https:// unless the host is localhost, 127.0.0.1 or [::1]");
+  }
 }
 
 /** The plane's answer as `{key, status, verdict, reason}`; `status` is "admit", "queued", "held", "in_flight", … */

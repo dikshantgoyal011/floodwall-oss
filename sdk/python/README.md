@@ -22,8 +22,23 @@ rejected, expires or lapses. Rate limits (HTTP 429) are waited out.
 
 - `submit`, `wait` and `report` are the steps `guard` takes.
 - `when_unreachable="open"` applies a change unchecked when the plane cannot
-  be reached (network errors and 5xx only) and calls `on_fail_open`. The
-  default, `"closed"`, refuses it.
+  be reached (`URLError`, timeouts, connection errors and 5xx only) and calls
+  `on_fail_open(intent, error)`. Invalid changes, signing errors and a missing
+  `cryptography` package always raise. The default, `"closed"`, refuses it.
+  The default `on_fail_open` warns with the agent, kind, resource and error,
+  never the manifest.
+- A timeout leaves the intent **held** on the plane: `NotAdmitted` with
+  status `"held"` means it may still be released later. Do not apply the change
+  afterwards without submitting it again.
+- `wait` never polls more than once a second, whatever the server does.
+- If `apply` raises and reporting the failure fails too, your exception is
+  still the one raised (the report error is on its `report_error`). If `apply`
+  succeeds but the report fails, `guard` returns the result and calls
+  `on_report_error(error, key)` (default: `warnings.warn`). Failure reasons are
+  sent with whitespace collapsed, at most 1024 characters.
+- `base_url` must be `https://`, except for `localhost`, `127.0.0.1` and
+  `[::1]`. Redirects are never followed, and the key is not in `repr()`.
+- `Retry-After` may be seconds or an HTTP date.
 - `signing_key` signs each intent, for planes whose keyring requires it:
   `pip install floodwall[signing]`.
 
