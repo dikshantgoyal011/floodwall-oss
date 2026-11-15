@@ -562,6 +562,7 @@ mod tests {
         Keyring::new()
             .with("a", key("a").verifying_key())
             .with("b", key("b").verifying_key())
+            .with("c", key("c").verifying_key())
     }
 
     /// A plane that exercises everything: a fractional refill, a gate that
@@ -631,7 +632,9 @@ mod tests {
             Submit(scale("a", 4, "api", 1), 0),   // rate-limited: no token left
             Submit(scale("a", 1, "web", 2), 0),   // a duplicate
             Tick(1),
-            Submit(scale("b", 2, "db", 1), 1), // off the allowlist: evicts a#2
+            // Off the allowlist. The hold is full and a, b and c hold one
+            // each, so the oldest of them goes: a#2.
+            Submit(scale("c", 1, "db", 1), 1),
             Tick(2),
             Complete("a", 1, true, 3),
             Release("b", 1, 4),
@@ -639,7 +642,7 @@ mod tests {
             Submit(scale("a", 5, "cache", 1), 4),
             Submit(scale("a", 6, "api", 2), 4), // rate-limited again
             Tick(4),
-            Expire("b", 2, 6),
+            Expire("c", 1, 6),
             Complete("b", 1, false, 7),
             Complete("a", 4, true, 7),
             Tick(8),

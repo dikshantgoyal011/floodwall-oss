@@ -36,7 +36,7 @@ You cannot review your way out of that. You have to **govern throughput**: admit
 | **Admission** | [`admission`](src/admission.rs) | A per-agent token bucket caps how fast any one agent can push, so a single runaway loop cannot starve the fleet. A bounded priority queue orders what is waiting (highest priority first, FIFO within a priority) and applies backpressure once it is full. |
 | **Scheduler** | [`scheduler`](src/scheduler.rs) | Decides when each waiting intent may start. A `Global` change runs alone; `Region` changes run one at a time with their resource to themselves; narrow changes run in parallel across resources, up to a per-resource in-flight limit. A blocked intent keeps what it waits for from lower-priority work, so a wide change is not starved by the smaller ones behind it; optional aging raises what has waited long, so low-priority work is not starved by higher-priority work either. Two agents' contradictory changes to one resource within a conflict window are deferred. |
 | **Gate** | [`gate`](src/gate.rs) / [`policy`](src/policy.rs) | A stack of policies, each a pure function from an intent to a verdict, composed with **deny-overrides**: the harshest verdict wins, so one `Reject` blocks a change no matter how many policies admit it. |
-| **Hold** | [`hold`](src/hold.rs) | A `Defer` is "not yet", not "no". Deferred intents wait here until a human releases them (their deferrals are then waived; rejections still apply) or expires them, or until a TTL runs out. |
+| **Hold** | [`hold`](src/hold.rs) | A `Defer` is "not yet", not "no". Deferred intents wait here until a human releases them (their deferrals are then waived; rejections still apply) or expires them, or until a TTL runs out. A full hold evicts from the agent holding the most, so one agent's deferrals cannot push out another's. |
 | **Ledger** | [`ledger`](src/ledger.rs) | Every decision, release, expiry and outcome is appended to a SHA-256 hash chain together with its evidence: the action, the reason, each policy's verdict, and, for a decision, the versioned policy bundles its rules came from. Each record folds in the previous digest, so any retroactive edit to history breaks the chain. Every so many records the ledger cuts a [checkpoint](src/checkpoint.rs) (chain head + Merkle root), optionally signed by the plane, so an auditor can check the rest of the ledger from a checkpoint without replaying it from genesis. |
 
 The unit that flows through all of it is an [`Intent`](src/intent.rs): a change an agent *wants* to make, fully attributed, tagged with how urgent it is (`Priority`) and how much it can break (`BlastRadius`). Agents never touch production directly. They submit intents. The floodwall decides what runs, when, and alongside what; the caller applies each admitted change and reports back.
@@ -413,7 +413,7 @@ The counts start when the plane is built, or resumed from its ledger, as metrics
 ```text
 $ cargo run --release
 
-floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 385
+floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 373
 
   at the wall (signatures + admission control)
     forged         : 102 refused (bad signature)
@@ -422,33 +422,33 @@ floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 
     queued         : 946
 
   scheduler (what may run now)
-    peak in flight : 7 across 4 resources
-    region changes : 26, one at a time
+    peak in flight : 8 across 4 resources
+    region changes : 25, one at a time
     global changes : 6, each alone
 
   through the gate (policies + conflict check)
-    admitted       : 359
-    deferred       : 547 (318 contradicted another agent)
+    admitted       : 348
+    deferred       : 553 (316 contradicted another agent)
     rejected       : 231
 
   hold queue (human in the loop)
-    released       : 191 (0 still rejected)
-    expired        : 194 by the operator, 162 by TTL or a full hold
+    released       : 186 (0 still rejected)
+    expired        : 204 by the operator, 163 by TTL or a full hold
 
   applied (reported back)
-    succeeded      : 330
-    failed         : 29
+    succeeded      : 323
+    failed         : 25
 
   ledger (tamper-evident)
-    records        : 2989
-    head digest    : d68d4329a68a61b6b1fc77d51850f5627982a9dbef07f82e77609c891236b16c
+    records        : 2979
+    head digest    : 3dfb8d835912e386ae1947b75464afcc6e0323d9d672f9ef5c34213fd4d27e0f
     chain valid    : true
-    signatures     : all 2989 records signed by their agents
+    signatures     : all 2979 records signed by their agents
 
   checkpoints (audit without replaying)
     checkpoints    : 12, all signed by the plane
-    suffix audit   : records 2816..2989 checked from the checkpoint at 2816: ok
-    inclusion      : record 996 proven in the latest root with 12 hashes: true
+    suffix audit   : records 2816..2979 checked from the checkpoint at 2816: ok
+    inclusion      : record 993 proven in the latest root with 12 hashes: true
 ```
 
 Five agents (including a `chaos-monkey`) fling 4000 changes at the wall. Admission control turns most of the flood away. The scheduler runs what is left in parallel across resources while serializing region-wide and global changes, the gate and conflict check sort each change into admit / defer / reject, and an operator works the hold queue every 10 ticks. Every admitted change is applied and reported back, and the ledger comes out the other side with its chain intact. Every agent signs its intents; the chaos monkey now and then forges one in the deployer's name, which is refused at the door, and every record left in the ledger verifies against the agents' public keys. Finally, an auditor who trusts the second-to-last signed checkpoint checks the rest of the ledger from it alone, and one record is proven to be in the ledger with a handful of hashes.

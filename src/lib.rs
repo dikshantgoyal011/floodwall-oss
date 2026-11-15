@@ -702,7 +702,8 @@ impl Floodwall {
         });
     }
 
-    /// Evict held intents over the hold's capacity, oldest first.
+    /// Evict held intents over the hold's capacity: each time, the oldest
+    /// of the agent holding the most (see [`HoldConfig::with_capacity`]).
     fn trim_hold(&mut self, report: &mut TickReport) {
         let evicted = self.hold.trim();
         self.expire_evicted(evicted, report);
@@ -1833,6 +1834,28 @@ mod tests {
             Some("evicted: the hold queue is full (capacity 1)")
         );
         assert_eq!(p.held().map(|h| h.intent.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn one_agents_deferrals_cannot_evict_another_agents_held_intent() {
+        let mut p = plane().with_hold(HoldConfig::default().with_capacity(4));
+        let from = |agent: &str, id| Intent {
+            agent: AgentId::new(agent),
+            ..off_list(id)
+        };
+        p.submit(from("victim", 1), 0).unwrap();
+        p.tick(0);
+        assert_eq!(p.held().count(), 1);
+        // The attacker fills the hold with its own deferrals, and then some.
+        for id in 1..=4 {
+            p.submit(from("attacker", id), 1).unwrap();
+        }
+        let report = p.tick(1);
+        assert_eq!(verdicts(&report), ["defer"; 4]);
+        assert_eq!(report.expired.len(), 1);
+        assert_eq!(report.expired[0].intent.key(), from("attacker", 1).key());
+        assert!(p.is_held(&from("victim", 1).key()));
+        assert_eq!(p.held().count(), 4);
     }
 
     #[test]
