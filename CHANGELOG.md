@@ -19,6 +19,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- One agent's deferrals can no longer evict other agents' held intents. A
+  full hold queue used to evict its globally oldest intent, whatever its
+  agent, so an agent that kept deferring its own intents (naming resources
+  off the allowlist, say) could fill the hold and then expire, with each
+  new deferral, an intent another agent had waiting for human approval. The
+  per-agent rate limit bounds how fast an agent pushes, not how much of the
+  hold it occupies. A full hold now evicts the oldest intent of the agent
+  holding the most, with ties going to the tied agent whose oldest intent
+  is oldest. An agent can only push out another's intent while it holds no
+  more than that agent does. The choice depends only on what is held, so
+  `Floodwall::resume` replays it the same way.
 - A signed intent can no longer be submitted twice. With a keyring, ids
   are now monotonic per agent, as `Intent::id` always documented: once an
   intent is queued, `Floodwall::submit` refuses any later signed intent
