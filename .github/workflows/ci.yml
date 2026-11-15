@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,7 +15,9 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -26,17 +31,21 @@ jobs:
       # that the export is enough to audit the ledger without this crate.
       # The demo also keeps its ledger on disk, and the edge-case test keeps
       # its ledger on disk too: each file must be its export, byte for byte,
-      # and verify the same way.
-      - uses: actions/setup-node@v7
+      # and verify the same way. The demo restarts its plane from the file
+      # halfway through; its ledger must be the same bytes as a run without
+      # the restart.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - name: verify exports independently
         run: |
           cargo run --release -- --export target/audit --ledger target/audit/durable.jsonl
+          cargo run --release -- --export target/audit-plain
           node tools/verify-ledger.mjs target/audit/ledger.jsonl target/audit/keys.json
           node tools/verify-ledger.mjs target/audit/ledger-suffix.jsonl target/audit/keys.json
           node tools/verify-ledger.mjs target/audit/durable.jsonl target/audit/keys.json
           cmp target/audit/ledger.jsonl target/audit/durable.jsonl
+          cmp target/audit-plain/ledger.jsonl target/audit/durable.jsonl
           node tools/verify-ledger.mjs target/export-fixture/edge.jsonl target/export-fixture/keys.json
           node tools/verify-ledger.mjs target/export-fixture/edge-suffix.jsonl target/export-fixture/keys.json
           node tools/verify-ledger.mjs target/export-fixture/durable.jsonl target/export-fixture/keys.json
@@ -45,8 +54,10 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -65,3 +76,42 @@ jobs:
             git status --short -- docs
             exit 1
           fi
+  # The sign-in service (api/): typecheck, bundle it as a deploy would, and
+  # run its tests against the bundle in the Workers runtime, with a local D1
+  # database, the planes' Durable Objects and a stand-in for Resend.
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      # The Worker runs each plane as the crate compiled to WebAssembly
+      # (`npm run wasm`, part of `build`). rustup is on the runner; this
+      # installs the toolchain and wasm32 target rust-toolchain.toml pins
+      # (`rustup show` did that before rustup 1.28).
+      - name: rust
+        run: rustup toolchain install || rustup show
+      - name: install
+        run: npm --prefix api ci
+      - name: check
+        run: npm --prefix api run check
+
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: typescript client
+        run: npm --prefix sdk/typescript test
+      - name: python client
+        working-directory: sdk/python
+        run: python3 -m unittest discover -s tests -t .

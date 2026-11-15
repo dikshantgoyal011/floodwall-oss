@@ -383,10 +383,24 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// Rebuild a ledger from complete export lines, each ending with `\n`,
 /// checking every line in order.
 fn load(bytes: &[u8]) -> Result<Ledger, ReadError> {
-    let mut ledger = Ledger::new();
+    load_into(Ledger::new(), bytes, true)
+}
+
+/// Add complete export lines, each ending with `\n`, to `ledger`, checking
+/// every line in order. With `header`, the first line must be a
+/// whole-ledger export's header; without, there is none, as in the lines
+/// after a checkpoint a ledger [starts at](Ledger::starting_at), where the
+/// checkpoint itself may be repeated first.
+pub(crate) fn load_into(
+    mut ledger: Ledger,
+    bytes: &[u8],
+    header: bool,
+) -> Result<Ledger, ReadError> {
     let mut offset = 0u64;
-    for (i, raw) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
-        let line = i as u64 + 1;
+    let first = usize::from(!header);
+    for (n, raw) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line = n as u64 + 1;
+        let i = n + first;
         let invalid = |problem: String| ReadError::Invalid {
             line,
             offset,
@@ -407,7 +421,9 @@ fn load(bytes: &[u8]) -> Result<Ledger, ReadError> {
             }
             (0, _) => return Err(invalid("the first line must be the header".into())),
             (_, Line::Header { .. }) => return Err(invalid("a second header".into())),
-            (_, Line::Record(r)) => ledger.restore_record(r).map_err(invalid)?,
+            (_, Line::Record(r)) => ledger.restore_record(*r).map_err(invalid)?,
+            // The checkpoint a ledger starts at, written again first.
+            (1, Line::Checkpoint(c)) if !header && ledger.start() == Some(&c) => {}
             (_, Line::Checkpoint(c)) => ledger.restore_checkpoint(c).map_err(invalid)?,
         }
         offset += raw.len() as u64;
@@ -477,6 +493,7 @@ mod tests {
             },
         ];
         for (n, action) in actions.into_iter().enumerate() {
+            ledger.advance_clock(from + 2 * n as u64 + 1);
             let id = if n == 0 {
                 u64::MAX - from
             } else {
@@ -507,6 +524,7 @@ mod tests {
                 action: "scale web to 0".into(),
                 reason: None,
                 policies: vec![],
+                bundles: vec![],
             },
         );
     }
@@ -774,8 +792,9 @@ mod tests {
             1,
             "a suffix export",
         );
+        // A file in the encoding before bundles were recorded.
         check(
-            edit(1, &|l| l.replace("record/v2", "record/v1")),
+            edit(1, &|l| l.replace("record/v4", "record/v3")),
             1,
             "unsupported record_encoding",
         );
@@ -851,6 +870,12 @@ mod tests {
             rehash(3, &|r| r.prev = crate::Digest::GENESIS),
             3,
             "record 1 does not link to the record before it",
+        );
+        // Records 0 and 1 are at ticks 1 and 3.
+        check(
+            rehash(3, &|r| r.tick = 0),
+            3,
+            "record 1 is at tick 0, before the record before it (tick 1)",
         );
         check(
             rehash(3, &|r| r.evidence.action = "destroy everything".into()),
@@ -1154,8 +1179,13 @@ mod tests {
         for id in 0..3 {
             plane.submit(scale(id, &format!("svc-{id}")), 0).unwrap();
         }
-        // Submitting records nothing.
-        assert_eq!(log.take(), []);
+        // Each intent that gets in is written and synced before submit
+        // returns.
+        let ops = log.take();
+        assert_eq!(ops.len(), 6);
+        for pair in ops.chunks(2) {
+            assert!(matches!(pair, [Op::Write(w), Op::Sync] if w.contains("\"queued\"")));
+        }
         let report = plane.tick(0);
         assert_eq!(report.decisions.len(), 3);
         // Three records written, then one sync, all before tick returned.
@@ -1217,7 +1247,9 @@ mod tests {
 
     #[test]
     fn a_plane_stops_before_acting_on_a_decision_it_could_not_keep() {
-        for (fail_write, fail_sync) in [(Some(1), None), (None, Some(0))] {
+        // The three arrivals take writes and syncs 0 to 2; the tick's second
+        // decision is write 4, and its sync is sync 3.
+        for (fail_write, fail_sync) in [(Some(4), None), (None, Some(3))] {
             let log = Log {
                 fail_write,
                 fail_sync,
@@ -1243,7 +1275,7 @@ mod tests {
                 Some(_) => {
                     assert_eq!(in_flight, [0]);
                     assert_eq!(plane.pending(), 1);
-                    assert_eq!(plane.ledger().len(), 1);
+                    assert_eq!(plane.ledger().len(), 4);
                 }
                 None => {
                     assert_eq!(in_flight, [0, 1, 2]);

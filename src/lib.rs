@@ -66,17 +66,24 @@ pub mod ed25519;
 pub mod export;
 pub mod gate;
 pub mod hold;
+pub mod host;
 pub mod intent;
 mod json;
 pub mod keyring;
 pub mod ledger;
 pub mod merkle;
 pub mod policy;
+pub mod reconfigure;
+pub mod replay;
+pub mod rules;
 pub mod scheduler;
 pub mod sha256;
 pub mod sha512;
+pub mod snapshot;
+pub mod stats;
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 pub use admission::{Admission, InvalidRateLimit, RateLimit, Rejected};
@@ -90,10 +97,18 @@ pub use keyring::{AuthError, Keyring};
 pub use ledger::{Digest, Evidence, Ledger, Record, SignatureError, SignatureProblem};
 pub use merkle::FrontierFull;
 pub use policy::{Policy, Verdict};
-pub use scheduler::{InFlight, SchedulerConfig};
+pub use reconfigure::Settings;
+pub use replay::ResumeError;
+pub use rules::BundleId;
+pub use scheduler::{Aging, InFlight, Lease, SchedulerConfig};
+pub use snapshot::Snapshot;
+pub use stats::{Counts, Stats};
 
+use admission::QueueKey;
 use hold::Hold;
+use intent::AgentId;
 use scheduler::{Readiness, Scheduler};
+use stats::{Counters, Event};
 
 // Compile and run the README's examples as doctests, so they cannot drift
 // from the API.
@@ -108,6 +123,14 @@ pub const CONFLICT_CHECK: &str = "conflict-window";
 /// The name the signature check has in a decision's breakdown, when the
 /// plane has a [`Keyring`].
 pub const SIGNATURE_CHECK: &str = "agent-signature";
+
+/// The ledger verdict for an intent that got through admission into the
+/// queue ([`Floodwall::submit`]).
+pub const QUEUED: &str = "queued";
+
+/// The ledger verdict for an intent in flight past its lease, which a
+/// [`Floodwall::tick`] failed (see [`Lease::Fail`]).
+pub const LAPSED: &str = "lapsed";
 
 /// The outcome of ruling on one intent: the intent itself, the combined
 /// verdict, and the per-policy breakdown that produced it.
@@ -134,6 +157,13 @@ pub struct TickReport {
     /// Held intents that expired in this tick: past their TTL, or evicted
     /// from a full hold queue.
     pub expired: Vec<Held>,
+    /// Under [`Lease::Report`], the intents in flight past their lease, by
+    /// key. Every tick reports each one until the caller completes it.
+    pub overdue: Vec<InFlight>,
+    /// Under [`Lease::Fail`], the intents in flight past their lease that
+    /// lapsed in this tick, by key: recorded as [`LAPSED`], and no longer in
+    /// flight. Do not apply them.
+    pub lapsed: Vec<InFlight>,
 }
 
 impl TickReport {
@@ -227,12 +257,34 @@ pub struct Floodwall {
     /// them. Their deferrals are waived when they are next ruled on.
     released: HashMap<IntentKey, String>,
     /// Every intent that is queued, in flight, or held. An intent key can
-    /// only be live once, so a resubmitted duplicate is refused.
+    /// only be live once, so a resubmitted duplicate is refused. (With a
+    /// keyring, [`Floodwall::submit`] also refuses ids below an agent's
+    /// mark, `signed_ids`.)
     live: HashSet<IntentKey>,
     /// With a keyring, every intent must be signed by its agent's key.
     keyring: Option<Keyring>,
     /// Live intents already checked against the current keyring.
     authenticated: HashSet<IntentKey>,
+    /// With a keyring: the highest id queued for each of its agents. Ids
+    /// are monotonic per agent, so a signed intent whose id is not above
+    /// its agent's mark is a replay and is refused (see
+    /// [`Floodwall::submit`]). One entry per agent the keyring vouched for.
+    signed_ids: BTreeMap<AgentId, u64>,
+    /// While [`Floodwall::resume`] replays a pass: for each intent the
+    /// ledger shows that pass ruling on, whether its signature check
+    /// passed (see [`crate::replay`]).
+    replayed_checks: Option<HashMap<IntentKey, bool>>,
+    /// While [`Floodwall::resume`] replays a pass: for each intent the
+    /// ledger shows that pass ruling on, the bundles its decision records
+    /// (see [Policy bundles](crate::replay#policy-bundles)).
+    replayed_bundles: Option<HashMap<IntentKey, Vec<BundleId>>>,
+    /// What the plane has done since it was built or resumed (see
+    /// [`crate::stats`]).
+    counters: Counters,
+    /// The label of the settings in force: the latest
+    /// [`reconfigure`](Floodwall::reconfigure)'s, or the one given to
+    /// [`Floodwall::with_settings_label`]. Snapshots record it.
+    settings_label: Option<String>,
     clock: u64,
 }
 
@@ -268,7 +320,10 @@ impl Floodwall {
             }
             live.insert(key);
         }
+        let mut counters = Counters::default();
+        counters.queue_depth(admission.len());
         Ok(Self {
+            counters,
             clock: admission.clock(),
             admission,
             scheduler: Scheduler::new(SchedulerConfig::default()),
@@ -279,6 +334,10 @@ impl Floodwall {
             live,
             keyring: None,
             authenticated: HashSet::new(),
+            signed_ids: BTreeMap::new(),
+            replayed_checks: None,
+            replayed_bundles: None,
+            settings_label: None,
         })
     }
 
@@ -292,10 +351,49 @@ impl Floodwall {
     /// shows in the breakdown as [`SIGNATURE_CHECK`]. Ledger records carry
     /// each intent's signature, so [`Ledger::verify_signatures`] can prove
     /// authorship later.
+    ///
+    /// Ids are monotonic per agent: once an intent is queued, the plane
+    /// refuses any later signed intent from the same agent whose id is not
+    /// above it, with [`Rejected::Duplicate`], so a signed intent copied
+    /// from this plane's ledger or an export of it cannot be submitted
+    /// again, here or on a plane resumed from that ledger. A plane started
+    /// on a new ledger knows nothing of the old one's ids: give agents new
+    /// keys when you start one. Changing the keyring keeps what the plane
+    /// knows; intents already live and signed by their agent's key on the
+    /// new keyring count too.
     pub fn with_keyring(mut self, keyring: Keyring) -> Self {
+        let live = self
+            .admission
+            .waiting()
+            .chain(self.scheduler.in_flight().map(|f| &f.intent))
+            .chain(self.hold.iter().map(|h| &h.intent));
+        for intent in live {
+            // Only an intent its agent signed may raise the agent's mark: an
+            // adopted forgery must not lock the agent out.
+            if keyring.authenticate(intent).is_ok() {
+                let mark = self.signed_ids.entry(intent.agent.clone()).or_insert(0);
+                *mark = (*mark).max(intent.id);
+            }
+        }
         self.keyring = Some(keyring);
         self.authenticated.clear();
         self
+    }
+
+    /// Name the settings this plane was built with `label`, as
+    /// [`Floodwall::reconfigure`] names the settings it changes to. A
+    /// [`Snapshot`] records the label of the settings in force, so a plane
+    /// resumed from it can be given them again (see [`crate::snapshot`]).
+    pub fn with_settings_label(mut self, label: impl Into<String>) -> Self {
+        self.settings_label = Some(label.into());
+        self
+    }
+
+    /// The label of the settings in force: the latest
+    /// [`reconfigure`](Floodwall::reconfigure)'s, or the one given to
+    /// [`Floodwall::with_settings_label`], if any.
+    pub fn settings_label(&self) -> Option<&str> {
+        self.settings_label.as_deref()
     }
 
     /// The keyring in use, if signatures are required.
@@ -344,26 +442,76 @@ impl Floodwall {
     /// nothing about the queue and cannot spend an agent's rate allowance.
     /// Then an intent whose [`IntentKey`] is already queued, in flight or
     /// held is refused with [`Rejected::Duplicate`], before the rate limit
-    /// is touched. Last, admission may refuse it with
+    /// is touched. With a keyring, so is a signed intent whose id is not
+    /// above the highest id the plane has queued for its agent: ids are
+    /// monotonic per agent, so this is a replay of signed bytes the agent
+    /// sent before, even if that intent is done and forgotten. Last, admission may refuse it with
     /// [`Rejected::Backpressure`] or [`Rejected::RateLimited`].
+    ///
+    /// An intent that gets in is recorded in the ledger as `queued`, so it
+    /// is not lost if the plane stops before ruling on it (see
+    /// [`Floodwall::resume`]). Refused intents change nothing and are not
+    /// recorded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ledger is on disk and cannot be written (see
+    /// [Durability](Floodwall#durability)).
     pub fn submit(&mut self, intent: Intent, now: u64) -> Result<(), Rejected> {
         let now = self.advance(now);
-        if let Some(keyring) = &self.keyring {
-            keyring.authenticate(&intent).map_err(|e| match e {
+        let agent = intent.agent.clone();
+        let result = match &self.keyring {
+            Some(keyring) => keyring.authenticate(&intent).map_err(|e| match e {
                 AuthError::Unsigned => Rejected::Unsigned,
                 AuthError::UnknownAgent => Rejected::UnknownAgent,
                 AuthError::BadSignature => Rejected::BadSignature,
-            })?;
+            }),
+            None => Ok(()),
         }
+        .and_then(|()| match self.signed_ids.get(&intent.agent) {
+            // Only a keyring sets marks, and only for its own agents.
+            Some(&mark) if self.keyring.is_some() && intent.id <= mark => Err(Rejected::Duplicate),
+            _ => Ok(()),
+        })
+        .and_then(|()| self.queue(intent, now));
+        match result {
+            Ok(()) => {
+                self.counters.count(agent.as_str(), Event::Queued);
+                self.counters.queue_depth(self.admission.len());
+            }
+            Err(why) => {
+                // Only the keyring's agents get counts of their own: an
+                // intent refused at the door may name anyone.
+                let trusted = self
+                    .keyring
+                    .as_ref()
+                    .is_none_or(|k| k.get(&agent).is_some());
+                self.counters.refused(agent.as_str(), why, trusted);
+            }
+        }
+        result
+    }
+
+    /// Let an intent in, past the signature check: refuse a duplicate,
+    /// then put it through admission, and record it as `queued` if it gets
+    /// in. A keyring's check, if any, was done by the caller (or, in a
+    /// replay, when the intent was first submitted).
+    fn queue(&mut self, intent: Intent, now: u64) -> Result<(), Rejected> {
         let key = intent.key();
         if self.live.contains(&key) {
             return Err(Rejected::Duplicate);
         }
-        self.admission.submit(intent, now)?;
+        self.admission.submit(intent.clone(), now)?;
         if self.keyring.is_some() {
             self.authenticated.insert(key.clone());
+            // A replay rebuilds the marks from the queued records, without
+            // refusing any: history may predate them.
+            let mark = self.signed_ids.entry(intent.agent.clone()).or_insert(0);
+            *mark = (*mark).max(intent.id);
         }
         self.live.insert(key);
+        self.record(&intent, QUEUED, None, Vec::new(), Vec::new());
+        self.persist();
         Ok(())
     }
 
@@ -374,8 +522,12 @@ impl Floodwall {
     }
 
     /// One scheduling pass at logical time `now`: first expire held
-    /// intents past their TTL or over the hold's capacity, then walk the
-    /// queue in priority order and rule on every intent that may start now.
+    /// intents past their TTL or over the hold's capacity, and report or
+    /// lapse intents in flight past their lease (see
+    /// [Leases](scheduler#leases)), then walk the queue in priority order
+    /// (raised by how long each intent has waited, under
+    /// [aging](scheduler#aging)) and rule on every intent that may start
+    /// now.
     /// Everything is recorded in the ledger. Admitted intents are
     /// dispatched: apply them, then call [`Floodwall::complete`]. Deferred
     /// intents are held: see [`Floodwall::release`].
@@ -398,8 +550,9 @@ impl Floodwall {
             }
         }
         self.trim_hold(&mut report);
+        self.mind_leases(now, &mut report);
         let mut pass = self.scheduler.begin(now);
-        for position in self.admission.queued_keys() {
+        for position in self.pass_order(now) {
             if pass.is_closed() {
                 break;
             }
@@ -431,6 +584,53 @@ impl Floodwall {
         report
     }
 
+    /// Every queue position, in the order a pass at tick `now` walks them:
+    /// highest priority first, and in the order they joined the queue
+    /// within a priority. Under aging, an intent's priority is the one it
+    /// has aged to by `now` (see [Aging](scheduler#aging)).
+    fn pass_order(&self, now: u64) -> Vec<QueueKey> {
+        let mut order = self.admission.queued_keys();
+        if let Some(aging) = self.scheduler.config().aging() {
+            order.sort_by_key(|position| {
+                let waited = now.saturating_sub(position.since());
+                (
+                    Reverse(aging.priority(position.priority(), waited)),
+                    position.seq(),
+                )
+            });
+        }
+        order
+    }
+
+    /// Deal with the intents in flight past their lease at tick `now`:
+    /// report them, or lapse them, freeing their place for this pass.
+    fn mind_leases(&mut self, now: u64, report: &mut TickReport) {
+        let Some(lease) = self.scheduler.config().lease() else {
+            return;
+        };
+        let overdue: Vec<InFlight> = self.scheduler.overdue(now).cloned().collect();
+        let Lease::Fail(ticks) = lease else {
+            report.overdue = overdue;
+            return;
+        };
+        for lapsed in overdue {
+            let key = lapsed.intent.key();
+            self.scheduler
+                .finish(&key, now)
+                .expect("an overdue intent is in flight");
+            self.forget(&key);
+            let reason = format!(
+                "in flight since tick {} for {} ticks, reaching the lease of {ticks}",
+                lapsed.since,
+                now - lapsed.since
+            );
+            self.record(&lapsed.intent, LAPSED, Some(reason), Vec::new(), Vec::new());
+            self.counters
+                .count(lapsed.intent.agent.as_str(), Event::Lapsed);
+            report.lapsed.push(lapsed);
+        }
+    }
+
     /// Rule on an intent that may start now, record the decision, and act
     /// on it: dispatch it if admitted, hold it if deferred.
     ///
@@ -442,16 +642,35 @@ impl Floodwall {
         let key = intent.key();
         let GateDecision { mut breakdown, .. } = self.gate.evaluate(&intent);
         if let Some(keyring) = &self.keyring {
-            let signature = if self.authenticated.contains(&key) {
-                Verdict::Admit
-            } else {
-                match keyring.authenticate(&intent) {
+            let replayed = self
+                .replayed_checks
+                .as_ref()
+                .and_then(|checks| checks.get(&key).copied());
+            let signature = match replayed {
+                // Replaying a check the ledger shows passing: resume has
+                // verified every signature in it already.
+                Some(true) => Verdict::Admit,
+                // Replaying one it shows failing: it must fail against this
+                // keyring too, or the replay diverges.
+                Some(false) => match keyring.authenticate(&intent) {
+                    Ok(()) => Verdict::Admit,
+                    Err(e) => Verdict::Reject(e.to_string()),
+                },
+                // Checked against this keyring already. Not while resume
+                // replays a pass: a decision past what the ledger shows is
+                // made now (see crate::replay#crashes), and what vouched for
+                // the intent in the past (a retired key) is not permission
+                // now.
+                None if self.replayed_checks.is_none() && self.authenticated.contains(&key) => {
+                    Verdict::Admit
+                }
+                None => match keyring.authenticate(&intent) {
                     Ok(()) => {
                         self.authenticated.insert(key.clone());
                         Verdict::Admit
                     }
                     Err(e) => Verdict::Reject(e.to_string()),
-                }
+                },
             };
             breakdown.push((SIGNATURE_CHECK.to_string(), signature));
         }
@@ -476,7 +695,21 @@ impl Floodwall {
             .iter()
             .map(|(name, verdict)| (name.clone(), verdict.label().to_string()))
             .collect();
-        self.record(&intent, verdict.label(), reason, policies);
+        // Replaying, a decision keeps the bundles the ledger shows when the
+        // gate holds bundles of the same names: a restart may move to
+        // another revision of them (see crate::replay#policy-bundles).
+        let gate_bundles = self.gate.bundles();
+        let bundles = match self.replayed_bundles.as_ref().and_then(|b| b.get(&key)) {
+            Some(recorded) if same_names(recorded, gate_bundles) => recorded.clone(),
+            _ => gate_bundles.to_vec(),
+        };
+        self.record(&intent, verdict.label(), reason, policies, bundles);
+        let event = match &verdict {
+            Verdict::Admit => Event::Admitted,
+            Verdict::Defer(_) => Event::Deferred,
+            Verdict::Reject(_) => Event::Rejected,
+        };
+        self.counters.count(intent.agent.as_str(), event);
         match &verdict {
             Verdict::Admit => self.scheduler.start(intent.clone(), now),
             Verdict::Defer(why) => {
@@ -495,7 +728,8 @@ impl Floodwall {
         });
     }
 
-    /// Evict held intents over the hold's capacity, oldest first.
+    /// Evict held intents over the hold's capacity: each time, the oldest
+    /// of the agent holding the most (see [`HoldConfig::with_capacity`]).
     fn trim_hold(&mut self, report: &mut TickReport) {
         let evicted = self.hold.trim();
         self.expire_evicted(evicted, report);
@@ -512,7 +746,15 @@ impl Floodwall {
     /// Record a held intent's expiry and forget it.
     fn expire_held(&mut self, held: Held, reason: String, report: &mut TickReport) {
         self.forget(&held.intent.key());
-        self.record(&held.intent, "expired", Some(reason), Vec::new());
+        self.counters
+            .count(held.intent.agent.as_str(), Event::Expired);
+        self.record(
+            &held.intent,
+            "expired",
+            Some(reason),
+            Vec::new(),
+            Vec::new(),
+        );
         report.expired.push(held);
     }
 
@@ -543,18 +785,28 @@ impl Floodwall {
             "released by {by}; held since tick {} for: {}",
             held.since, held.reason
         );
-        self.record(&held.intent, "released", Some(reason), Vec::new());
+        self.record(
+            &held.intent,
+            "released",
+            Some(reason),
+            Vec::new(),
+            Vec::new(),
+        );
         self.persist();
+        self.counters
+            .count(held.intent.agent.as_str(), Event::Released);
         self.admission
             .requeue(held.intent, now)
             .expect("checked the queue has room above");
+        self.counters.queue_depth(self.admission.len());
         self.released.insert(key.clone(), by.to_string());
         Ok(())
     }
 
     /// Drop a held intent at logical time `now`, on the authority of `by`
     /// (recorded in the ledger), and return it. Its key may then be
-    /// submitted again.
+    /// submitted again, on a plane without a keyring; with one, ids are
+    /// monotonic per agent, so send it again under a new id.
     ///
     /// # Panics
     ///
@@ -572,14 +824,21 @@ impl Floodwall {
             "expired",
             Some(format!("expired by {by}")),
             Vec::new(),
+            Vec::new(),
         );
         self.persist();
+        self.counters
+            .count(held.intent.agent.as_str(), Event::Expired);
         Ok(held)
     }
 
     /// Report that applying an in-flight intent finished at logical time
     /// `now`. Frees its place in the scheduler, records the outcome in the
     /// ledger, and returns the intent.
+    ///
+    /// Fails with [`NotInFlight`] if the intent is not in flight: it was
+    /// never dispatched, has been completed already, or lapsed past its
+    /// lease (see [Leases](scheduler#leases)).
     ///
     /// # Panics
     ///
@@ -601,24 +860,41 @@ impl Floodwall {
             Outcome::Succeeded => None,
             Outcome::Failed(why) => Some(why.clone()),
         };
-        self.record(&finished.intent, outcome.label(), reason, Vec::new());
+        self.record(
+            &finished.intent,
+            outcome.label(),
+            reason,
+            Vec::new(),
+            Vec::new(),
+        );
         self.persist();
+        let event = match outcome {
+            Outcome::Succeeded => Event::Succeeded,
+            Outcome::Failed(_) => Event::Failed,
+        };
+        self.counters.count(finished.intent.agent.as_str(), event);
         Ok(finished.intent)
     }
 
-    /// Record what happened to `intent`. A ledger on disk writes the record
-    /// now and syncs it in [`Floodwall::persist`], before the call that
-    /// recorded it returns.
+    /// Record what happened to `intent`, at the plane's clock. A ledger on
+    /// disk writes the record now and syncs it in [`Floodwall::persist`],
+    /// before the call that recorded it returns.
     fn record(
         &mut self,
         intent: &Intent,
         label: &str,
         reason: Option<String>,
         policies: Vec<(String, String)>,
+        bundles: Vec<BundleId>,
     ) {
+        let tick = self.ledger.advance_clock(self.clock);
+        debug_assert_eq!(
+            tick, self.clock,
+            "the ledger's clock ran ahead of the plane's"
+        );
         if let Err(e) = self
             .ledger
-            .write_intent(intent, label, reason, policies, false)
+            .write_intent(intent, label, reason, policies, bundles, false)
         {
             ledger::write_failed(e);
         }
@@ -637,9 +913,14 @@ impl Floodwall {
         self.admission.len()
     }
 
-    /// The waiting intents, in the order a pass considers them.
+    /// The waiting intents, in the order a pass at the plane's
+    /// [`clock`](Floodwall::clock) considers them. Under
+    /// [aging](scheduler#aging), a later pass may consider them in another
+    /// order, as they age.
     pub fn queued(&self) -> impl Iterator<Item = &Intent> {
-        self.admission.waiting()
+        self.pass_order(self.clock)
+            .into_iter()
+            .map(move |position| self.admission.get(&position).expect("a queued position"))
     }
 
     /// The intents dispatched and not yet completed, ordered by key.
@@ -650,6 +931,19 @@ impl Floodwall {
     /// The held (deferred) intents, oldest first.
     pub fn held(&self) -> impl Iterator<Item = &Held> {
         self.hold.iter()
+    }
+
+    /// What the plane has done since it was built or resumed, per agent and
+    /// across the fleet, and where it stands now: how deep the queue is, and
+    /// has been at most, how much is in flight and how much of that is past
+    /// its lease, and how much is held (see [`crate::stats`]).
+    pub fn stats(&self) -> Stats {
+        self.counters.snapshot(
+            self.admission.len(),
+            self.scheduler.in_flight().count(),
+            self.scheduler.overdue(self.clock).count(),
+            self.hold.iter().count(),
+        )
     }
 
     /// Whether the intent `key` is held.
@@ -672,16 +966,27 @@ impl Floodwall {
     /// [`Ledger::with_signer`]). A ledger on disk ([`Ledger::create`]) keeps
     /// every decision durably (see [Durability](Floodwall#durability)).
     ///
+    /// The plane and its ledger keep one clock, so each record carries the
+    /// tick the plane acted at: adopting `ledger` moves whichever clock is
+    /// behind up to the other ([`Floodwall::clock`],
+    /// [`Ledger::clock`](crate::Ledger::clock)).
+    ///
     /// # Panics
     ///
-    /// Panics if `ledger` already has records, or this plane has already
-    /// recorded something: a ledger is one plane's history from the start.
-    /// (Resuming a plane from a reopened ledger is FW-402.)
-    pub fn with_ledger(mut self, ledger: Ledger) -> Self {
+    /// Panics if `ledger` already has records (before a checkpoint it
+    /// starts at, too), or this plane has already recorded something: a
+    /// ledger is one plane's history from the start. To carry on from a
+    /// ledger that has
+    /// records, use [`Floodwall::resume`], or, from a snapshot,
+    /// [`Floodwall::resume_from_snapshot`].
+    pub fn with_ledger(mut self, mut ledger: Ledger) -> Self {
         assert!(
-            ledger.is_empty() && self.ledger.is_empty(),
-            "with_ledger needs an empty ledger and a plane that has not recorded anything"
+            ledger.size() == 0 && self.ledger.size() == 0,
+            "with_ledger needs an empty ledger and a plane that has not recorded anything; \
+             use Floodwall::resume to carry on from a ledger with records"
         );
+        let clock = self.advance(ledger.clock());
+        ledger.advance_clock(clock);
         self.ledger = ledger;
         self
     }
@@ -696,6 +1001,12 @@ impl Floodwall {
     pub fn checkpoint(&mut self) -> Checkpoint {
         self.ledger.checkpoint()
     }
+}
+
+/// Whether two lists of bundles name the same bundles, in the same order,
+/// whatever their revisions.
+fn same_names(a: &[BundleId], b: &[BundleId]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
 }
 
 /// The ledger reason for a decision on a released intent: who released
@@ -761,7 +1072,14 @@ mod tests {
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.decisions[0].verdict, Verdict::Admit);
         assert_eq!(p.pending(), 0);
-        assert_eq!(p.ledger().len(), 1);
+        // Its arrival in the queue, then the decision.
+        let verdicts: Vec<&str> = p
+            .ledger()
+            .records()
+            .iter()
+            .map(|r| r.verdict.as_str())
+            .collect();
+        assert_eq!(verdicts, [QUEUED, "admit"]);
         assert!(p.ledger().verify());
     }
 
@@ -784,8 +1102,8 @@ mod tests {
         assert!(matches!(report.decisions[0].verdict, Verdict::Reject(_)));
         assert_eq!(report.admitted().count(), 0);
         // Even rejected decisions are written to the ledger.
-        assert_eq!(p.ledger().len(), 1);
-        let record = &p.ledger().records()[0];
+        assert_eq!(p.ledger().len(), 2);
+        let record = &p.ledger().records()[1];
         assert_eq!(record.verdict, "reject");
         // The record says what the change was and why it was stopped.
         assert_eq!(record.evidence.action, "destroy web");
@@ -1371,8 +1689,9 @@ mod tests {
             p.release(&queued, "alice", 0),
             Err(HoldError::NotHeld(queued.clone()))
         );
-        // Nothing was recorded for the failed attempts.
-        assert_eq!(p.ledger().len(), 1);
+        // Nothing was recorded for the failed attempts: just the arrival
+        // and the decision.
+        assert_eq!(p.ledger().len(), 2);
 
         p.submit(off_list(2), 0).unwrap();
         p.tick(0);
@@ -1404,6 +1723,82 @@ mod tests {
         assert_eq!(p.ledger().len(), records);
         p.tick(1); // drains the queue
         assert_eq!(p.release(&key, "alice", 2), Ok(()));
+    }
+
+    #[test]
+    fn every_record_carries_the_tick_it_happened_at() {
+        let mut p = plane().with_hold(HoldConfig::default().with_ttl(Some(10)));
+        let (web, held, stale) = (scale(1, "web"), off_list(2), off_list(3));
+        for i in [&web, &held, &stale] {
+            p.submit(i.clone(), 0).unwrap();
+        }
+        p.tick(5); // web admitted, the other two held
+        p.complete(&web.key(), Outcome::Succeeded, 7).unwrap();
+        // A tick earlier than the clock is the clock.
+        p.release(&held.key(), "alice", 3).unwrap();
+        p.tick(8); // the released intent is ruled on again
+        p.tick(15); // the other one has been held for the TTL
+        let got: Vec<(String, u64)> = p
+            .ledger()
+            .records()
+            .iter()
+            .map(|r| (r.verdict.clone(), r.tick))
+            .collect();
+        let want = [
+            (QUEUED, 0),
+            (QUEUED, 0),
+            (QUEUED, 0),
+            ("admit", 5),
+            ("defer", 5),
+            ("defer", 5),
+            ("succeeded", 7),
+            ("released", 7),
+            ("admit", 8),
+            ("expired", 15),
+        ];
+        assert_eq!(
+            got,
+            want.map(|(v, t)| (v.to_string(), t)),
+            "verdicts and ticks"
+        );
+        assert_eq!((p.clock(), p.ledger().clock()), (15, 15));
+        assert!(p.ledger().verify());
+        // An operator's expiry, and a plane adopting a ledger that is behind
+        // its clock, both use the plane's clock.
+        let mut q = plane().with_ledger(Ledger::new());
+        q.submit(off_list(4), 20).unwrap();
+        q.tick(0);
+        q.expire(&off_list(4).key(), "bob", 1).unwrap();
+        let ticks: Vec<u64> = q.ledger().records().iter().map(|r| r.tick).collect();
+        assert_eq!(ticks, [20, 20, 20]);
+    }
+
+    #[test]
+    fn a_plane_and_its_ledger_keep_one_clock() {
+        // Review repro on #17: a ledger whose clock is ahead of the plane's.
+        // The plane catches up to it, so the decision, the dispatch and the
+        // record all happen at 100, not 5.
+        let mut ahead = Ledger::new();
+        ahead.advance_clock(100);
+        let mut p = plane().with_ledger(ahead);
+        assert_eq!((p.clock(), p.ledger().clock()), (100, 100));
+        p.submit(scale(1, "web"), 5).unwrap();
+        let report = p.tick(5);
+        assert!(report.decisions[0].verdict.is_admit());
+        assert_eq!(p.in_flight().next().unwrap().since, 100);
+        assert!(!p.ledger().is_empty());
+        assert!(p.ledger().records().iter().all(|r| r.tick == 100));
+        assert!(p.ledger().verify());
+        // A plane whose clock is ahead (its admission has seen tick 20)
+        // brings a new ledger up to it at once.
+        let mut admission = Admission::new(16, RateLimit::new(8.0, 1.0));
+        admission.prune_idle(20);
+        let mut q = Floodwall::new(admission, Gate::new()).with_ledger(Ledger::new());
+        assert_eq!((q.clock(), q.ledger().clock()), (20, 20));
+        q.submit(scale(2, "api"), 5).unwrap();
+        q.tick(5);
+        assert_eq!(q.in_flight().next().unwrap().since, 20);
+        assert!(q.ledger().records().iter().all(|r| r.tick == 20));
     }
 
     #[test]
@@ -1461,12 +1856,34 @@ mod tests {
             .iter()
             .map(|r| r.verdict.as_str())
             .collect();
-        assert_eq!(labels, ["defer", "defer", "expired"]);
+        assert_eq!(labels, [QUEUED, QUEUED, "defer", "defer", "expired"]);
         assert_eq!(
-            p.ledger().records()[2].evidence.reason.as_deref(),
+            p.ledger().records()[4].evidence.reason.as_deref(),
             Some("evicted: the hold queue is full (capacity 1)")
         );
         assert_eq!(p.held().map(|h| h.intent.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn one_agents_deferrals_cannot_evict_another_agents_held_intent() {
+        let mut p = plane().with_hold(HoldConfig::default().with_capacity(4));
+        let from = |agent: &str, id| Intent {
+            agent: AgentId::new(agent),
+            ..off_list(id)
+        };
+        p.submit(from("victim", 1), 0).unwrap();
+        p.tick(0);
+        assert_eq!(p.held().count(), 1);
+        // The attacker fills the hold with its own deferrals, and then some.
+        for id in 1..=4 {
+            p.submit(from("attacker", id), 1).unwrap();
+        }
+        let report = p.tick(1);
+        assert_eq!(verdicts(&report), ["defer"; 4]);
+        assert_eq!(report.expired.len(), 1);
+        assert_eq!(report.expired[0].intent.key(), from("attacker", 1).key());
+        assert!(p.is_held(&from("victim", 1).key()));
+        assert_eq!(p.held().count(), 4);
     }
 
     #[test]
@@ -1626,12 +2043,13 @@ mod tests {
         assert_eq!(names[names.len() - 2..], [SIGNATURE_CHECK, CONFLICT_CHECK]);
         p.complete(&IntentKey::new("bot", 1), Outcome::Succeeded, 1)
             .unwrap();
-        // Both records carry the intent's digest and signature.
+        // Every record (arrival, decision, outcome) carries the intent's
+        // digest and signature.
         for r in p.ledger().records() {
             assert_eq!(r.intent_digest(), Some(digest));
             assert!(r.signature().is_some());
         }
-        assert_eq!(p.ledger().verify_signatures(&keyring()), Ok(2));
+        assert_eq!(p.ledger().verify_signatures(&keyring()), Ok(3));
     }
 
     #[test]
@@ -1656,6 +2074,72 @@ mod tests {
         // Nothing reached the queue or the ledger.
         assert_eq!(p.pending(), 0);
         assert!(p.ledger().is_empty());
+    }
+
+    #[test]
+    fn changing_the_keyring_keeps_the_signed_ids_seen() {
+        let mut p = signed_plane();
+        let done = scale(1, "web").signed(&bot_key());
+        p.submit(done.clone(), 0).unwrap();
+        p.tick(0);
+        p.complete(&done.key(), Outcome::Succeeded, 1).unwrap();
+        // In flight when the keyring changes.
+        let flying = scale(5, "api").signed(&bot_key());
+        p.submit(flying.clone(), 1).unwrap();
+        p.tick(1);
+        let mut p = p.with_keyring(keyring());
+        assert_eq!(p.submit(done, 2), Err(Rejected::Duplicate));
+        p.complete(&flying.key(), Outcome::Succeeded, 3).unwrap();
+        assert_eq!(p.submit(flying, 4), Err(Rejected::Duplicate));
+        assert_eq!(p.submit(scale(6, "web").signed(&bot_key()), 4), Ok(()));
+    }
+
+    #[test]
+    fn an_adopted_forgery_does_not_lock_its_agent_out() {
+        let mut admission = Admission::new(16, RateLimit::new(5.0, 1.0));
+        admission
+            .submit(scale(u64::MAX, "web").signed(&other_key()), 0)
+            .unwrap();
+        let mut p = Floodwall::new(admission, Gate::new()).with_keyring(keyring());
+        assert!(matches!(p.tick(0).decisions[0].verdict, Verdict::Reject(_)));
+        assert_eq!(p.submit(scale(1, "web").signed(&bot_key()), 1), Ok(()));
+    }
+
+    #[test]
+    fn a_signed_intent_cannot_be_replayed_once_it_is_done() {
+        // Audit lead: the same signed bytes, taken from the ledger after the
+        // intent completed, must not run a second time in bot's name.
+        let mut p = signed_plane();
+        let signed = scale(1, "web").signed(&bot_key());
+        p.submit(signed.clone(), 0).unwrap();
+        assert_eq!(verdicts(&p.tick(0)), ["admit"]);
+        p.complete(&signed.key(), Outcome::Succeeded, 1).unwrap();
+        assert_eq!(p.submit(signed.clone(), 2), Err(Rejected::Duplicate));
+        assert!(p.tick(2).decisions.is_empty());
+        // Nor an older id, nor one rejected by the gate.
+        assert_eq!(
+            p.submit(scale(0, "web").signed(&bot_key()), 2),
+            Err(Rejected::Duplicate)
+        );
+        let mut global = scale(2, "web");
+        global.blast_radius = BlastRadius::Global;
+        let global = global.signed(&bot_key());
+        p.submit(global.clone(), 3).unwrap();
+        assert!(matches!(p.tick(3).decisions[0].verdict, Verdict::Reject(_)));
+        assert_eq!(p.submit(global, 4), Err(Rejected::Duplicate));
+        // The next id goes through; other agents keep their own ids.
+        p.submit(scale(3, "web").signed(&bot_key()), 5).unwrap();
+        let mut theirs = scale(1, "api");
+        theirs.agent = AgentId::new("other");
+        p.submit(theirs.signed(&other_key()), 5).unwrap();
+        // A refusal at the door does not use up the id: a rate-limited
+        // intent may be sent again.
+        let admission = Admission::new(16, RateLimit::new(1.0, 1.0));
+        let mut q = Floodwall::new(admission, Gate::new()).with_keyring(keyring());
+        q.submit(scale(1, "web").signed(&bot_key()), 0).unwrap();
+        let next = scale(2, "web").signed(&bot_key());
+        assert_eq!(q.submit(next.clone(), 0), Err(Rejected::RateLimited));
+        assert_eq!(q.submit(next, 1), Ok(()));
     }
 
     #[test]
@@ -1742,15 +2226,17 @@ mod tests {
         assert_eq!(
             labels,
             [
+                QUEUED,
                 "defer",
                 "released",
                 "admit",
                 "succeeded",
+                QUEUED,
                 "defer",
                 "expired"
             ]
         );
-        assert_eq!(p.ledger().verify_signatures(&keyring()), Ok(6));
+        assert_eq!(p.ledger().verify_signatures(&keyring()), Ok(8));
         assert!(p.ledger().verify());
     }
 
@@ -1788,10 +2274,13 @@ mod tests {
             p.complete(&IntentKey::new("bot", id), Outcome::Succeeded, 1)
                 .unwrap();
         }
-        let latest = p.checkpoint(); // 6 records
+        let latest = p.checkpoint(); // 4 arrivals, 4 decisions, 2 outcomes
         let cps = p.ledger().checkpoints();
-        assert_eq!(cps.iter().map(|c| c.size).collect::<Vec<_>>(), [3, 6]);
-        assert_eq!(latest, cps[1]);
+        assert_eq!(
+            cps.iter().map(|c| c.size).collect::<Vec<_>>(),
+            [3, 6, 9, 10]
+        );
+        assert_eq!(latest, cps[3]);
         // An auditor holding only the first checkpoint and the plane's key
         // checks everything after it.
         let first = cps[0].clone();
@@ -1818,5 +2307,319 @@ mod tests {
         p.submit(scale(1, "web"), 0).unwrap();
         p.tick(0);
         let _ = p.with_ledger(Ledger::new());
+    }
+
+    fn leased(lease: Lease) -> Floodwall {
+        plane().with_scheduler(
+            SchedulerConfig::default()
+                .with_conflict_window(5)
+                .with_lease(Some(lease)),
+        )
+    }
+
+    fn keys(in_flight: &[InFlight]) -> Vec<String> {
+        in_flight
+            .iter()
+            .map(|f| f.intent.key().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_reported_lease_names_what_is_overdue_every_tick_and_records_nothing() {
+        let mut p = leased(Lease::Report(2));
+        p.submit(scale(1, "web"), 0).unwrap();
+        p.submit(scale(2, "web"), 0).unwrap();
+        assert_eq!(p.tick(0).decisions.len(), 1); // bot#2 waits for web
+        assert!(p.tick(1).overdue.is_empty());
+        let records = p.ledger().len();
+        for now in [2, 3] {
+            let report = p.tick(now);
+            assert_eq!(keys(&report.overdue), ["bot#1"], "tick {now}");
+            assert_eq!(report.overdue[0].since, 0);
+            assert!(report.lapsed.is_empty() && report.decisions.is_empty());
+        }
+        assert_eq!(p.ledger().len(), records, "reporting records nothing");
+        assert!(p.is_in_flight(&IntentKey::new("bot", 1)));
+        p.complete(&IntentKey::new("bot", 1), Outcome::Succeeded, 3)
+            .unwrap();
+        let report = p.tick(4);
+        assert!(report.overdue.is_empty());
+        assert_eq!(report.decisions[0].intent.id, 2);
+    }
+
+    #[test]
+    fn a_failing_lease_lapses_what_is_overdue_and_frees_its_place() {
+        let mut p = leased(Lease::Fail(2));
+        p.submit(scale(1, "web"), 0).unwrap();
+        p.submit(scale(2, "web"), 0).unwrap();
+        p.submit(scale(3, "api"), 0).unwrap();
+        p.tick(0); // bot#1 and bot#3 in flight, bot#2 waits for web
+        p.complete(&IntentKey::new("bot", 3), Outcome::Succeeded, 1)
+            .unwrap();
+        assert!(p.tick(1).lapsed.is_empty());
+        let report = p.tick(2);
+        assert_eq!(keys(&report.lapsed), ["bot#1"]);
+        assert!(report.overdue.is_empty());
+        // What waited for web starts in the same pass.
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].intent.id, 2);
+        let flying: Vec<u64> = p.in_flight().map(|f| f.intent.id).collect();
+        assert_eq!(flying, [2]);
+        // The lapse is recorded before the decision, at the tick.
+        let records = p.ledger().records();
+        let lapse = &records[records.len() - 2];
+        assert_eq!((lapse.intent_id, lapse.verdict.as_str()), (1, LAPSED));
+        assert_eq!(
+            lapse.evidence.reason.as_deref(),
+            Some("in flight since tick 0 for 2 ticks, reaching the lease of 2")
+        );
+        assert_eq!(lapse.tick, 2);
+        assert!(p.ledger().verify());
+        // The caller can no longer report back on it, and its key is free
+        // for a new intent.
+        assert_eq!(
+            p.complete(&IntentKey::new("bot", 1), Outcome::Succeeded, 3),
+            Err(NotInFlight(IntentKey::new("bot", 1)))
+        );
+        p.submit(scale(1, "api"), 3).unwrap();
+    }
+
+    #[test]
+    fn a_lapsed_claim_stays_open_for_the_conflict_window() {
+        // The change may have been partly applied, so another agent's
+        // contradictory one waits out the window, as after a completion.
+        let mut p = leased(Lease::Fail(2));
+        p.submit(scale_by("a", 1, "web", 3), 0).unwrap();
+        p.tick(0);
+        assert_eq!(p.tick(2).lapsed.len(), 1);
+        p.submit(scale_by("b", 1, "web", 9), 3).unwrap();
+        let report = p.tick(3);
+        let Verdict::Defer(why) = &report.decisions[0].verdict else {
+            panic!("{:?}", report.decisions[0].verdict);
+        };
+        assert!(
+            why.contains("by a#1, completed at tick 2; conflict window open until tick 7"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_global_frees_the_floor() {
+        let mut p = leased(Lease::Fail(3));
+        p.submit(global_apply(1, "api"), 0).unwrap();
+        p.tick(0);
+        p.submit(scale(2, "web"), 1).unwrap();
+        assert!(p.tick(1).decisions.is_empty(), "the global has the floor");
+        let report = p.tick(3);
+        assert_eq!(keys(&report.lapsed), ["bot#1"]);
+        assert_eq!(report.decisions[0].intent.id, 2);
+        assert_eq!(report.decisions[0].verdict, Verdict::Admit);
+    }
+
+    #[test]
+    fn without_a_lease_nothing_is_overdue() {
+        let mut p = plane();
+        p.submit(scale(1, "web"), 0).unwrap();
+        p.tick(0);
+        let report = p.tick(u64::MAX);
+        assert!(report.overdue.is_empty() && report.lapsed.is_empty());
+        assert!(p.is_in_flight(&IntentKey::new("bot", 1)));
+    }
+
+    fn aging(plane: Floodwall, aging: Option<Aging>) -> Floodwall {
+        plane.with_scheduler(SchedulerConfig::default().with_aging(aging))
+    }
+
+    fn apply(id: u64, resource: &str, priority: Priority, blast: BlastRadius) -> Intent {
+        let action = Action::Apply {
+            resource: resource.into(),
+            manifest: format!("m{id}"),
+        };
+        intent(id, action, priority, blast)
+    }
+
+    #[test]
+    fn bulk_work_starves_under_strict_priority_and_runs_once_aged() {
+        // web runs one change at a time. A Normal change for it arrives
+        // every tick, and the one in flight completes every tick, so there
+        // is always newer Normal work ahead of the Bulk one.
+        let run = |config| {
+            let mut p = aging(plane(), config);
+            p.submit(apply(1, "web", Priority::Bulk, BlastRadius::Cell), 0)
+                .unwrap();
+            for t in 0..40 {
+                let flying: Vec<IntentKey> = p.in_flight().map(|f| f.intent.key()).collect();
+                for key in flying {
+                    p.complete(&key, Outcome::Succeeded, t).unwrap();
+                }
+                p.submit(
+                    apply(100 + t, "web", Priority::Normal, BlastRadius::Cell),
+                    t,
+                )
+                .unwrap();
+                let report = p.tick(t);
+                assert_eq!(report.decisions.len(), 1, "web is free every tick");
+                if report.decisions[0].intent.id == 1 {
+                    assert_eq!(report.decisions[0].verdict, Verdict::Admit);
+                    return Some(t);
+                }
+            }
+            None
+        };
+        assert_eq!(run(None), None, "strict priority: it never runs");
+        // Aged to Normal after 5 ticks, it is the oldest Normal there is.
+        assert_eq!(run(Some(Aging::new(5, Priority::Normal))), Some(5));
+        assert_eq!(run(Some(Aging::new(1, Priority::Pager))), Some(1));
+        // A ceiling at Bulk ages nothing.
+        assert_eq!(run(Some(Aging::new(1, Priority::Bulk))), None);
+    }
+
+    #[test]
+    fn an_aged_wide_change_holds_back_newer_work_until_the_floor_clears() {
+        // Narrow changes on web take 2 ticks and on api 3, and new ones
+        // keep arriving, so the floor is never clear: under strict
+        // priority a Bulk Global waits forever behind them. Aged to Normal
+        // at tick 4, it is walked first, and keeps everything behind it
+        // back until the work in flight is done.
+        let run = |config| {
+            let admission = Admission::new(1024, RateLimit::new(64.0, 4.0));
+            let mut p = aging(Floodwall::new(admission, Gate::new()), config);
+            p.submit(apply(1, "web", Priority::Bulk, BlastRadius::Global), 0)
+                .unwrap();
+            let mut decided = Vec::new();
+            for t in 0..40 {
+                let done: Vec<IntentKey> = p
+                    .in_flight()
+                    .filter(|f| {
+                        let takes = if f.intent.action.resource() == "web" {
+                            2
+                        } else {
+                            3
+                        };
+                        t >= f.since + takes
+                    })
+                    .map(|f| f.intent.key())
+                    .collect();
+                for key in done {
+                    p.complete(&key, Outcome::Succeeded, t).unwrap();
+                }
+                p.submit(
+                    apply(100 + t, "web", Priority::Normal, BlastRadius::Cell),
+                    t,
+                )
+                .unwrap();
+                p.submit(
+                    apply(200 + t, "api", Priority::Normal, BlastRadius::Cell),
+                    t,
+                )
+                .unwrap();
+                let ids: Vec<u64> = p.tick(t).decisions.iter().map(|d| d.intent.id).collect();
+                decided.push(ids);
+            }
+            decided
+        };
+        let strict = run(None);
+        assert!(strict.iter().flatten().all(|&id| id != 1), "never ruled on");
+        let aged = run(Some(Aging::new(4, Priority::Normal)));
+        assert_eq!(aged[2], [101], "web is free, api is not");
+        assert_eq!(aged[3], [201]);
+        // Tick 4: web is free again, but the aged Global is ahead of the
+        // next web change and keeps it back, as it does at tick 5. At tick
+        // 6 the last change in flight is done, and the Global starts alone.
+        assert!(aged[4].is_empty() && aged[5].is_empty(), "{aged:?}");
+        assert_eq!(aged[6], [1]);
+        assert_eq!(strict[4], [102], "without aging, web's next change starts");
+    }
+
+    #[test]
+    fn aging_changes_when_a_change_is_ruled_on_not_the_ruling() {
+        // An aged Bulk change is walked as Pager, but the gate sees the
+        // priority the agent asked for, and the ledger records it.
+        let mut p = aging(plane(), Some(Aging::new(1, Priority::Pager)));
+        p.submit(scale(1, "web"), 0).unwrap();
+        p.tick(0); // web is taken
+        p.submit(apply(2, "web", Priority::Bulk, BlastRadius::Region), 0)
+            .unwrap();
+        assert!(p.tick(3).decisions.is_empty());
+        p.complete(&IntentKey::new("bot", 1), Outcome::Succeeded, 4)
+            .unwrap();
+        let report = p.tick(4);
+        assert_eq!(report.decisions[0].intent.priority, Priority::Bulk);
+        assert_eq!(
+            report.decisions[0].verdict,
+            Verdict::Reject("Region blast radius needs priority >= Urgent, got Bulk".into())
+        );
+        let record = p.ledger().records().last().unwrap();
+        assert_eq!(record.intent.as_ref().unwrap().priority, Priority::Bulk);
+        assert!(p.ledger().verify());
+    }
+
+    #[test]
+    fn aging_stops_at_its_ceiling() {
+        // A Bulk change has waited 100 ticks when an Urgent and a Pager one
+        // arrive. How far it has risen decides where it is walked.
+        let order = |config| {
+            let mut p = aging(plane(), config);
+            p.submit(apply(1, "web", Priority::Bulk, BlastRadius::Cell), 0)
+                .unwrap();
+            p.submit(apply(2, "web", Priority::Urgent, BlastRadius::Cell), 100)
+                .unwrap();
+            p.submit(apply(3, "web", Priority::Pager, BlastRadius::Cell), 100)
+                .unwrap();
+            let queued: Vec<u64> = p.queued().map(|i| i.id).collect();
+            let walked: Vec<u64> = p.tick(100).decisions.iter().map(|d| d.intent.id).collect();
+            assert_eq!(
+                walked[..1],
+                queued[..1],
+                "the pass starts where queued() does"
+            );
+            queued
+        };
+        assert_eq!(order(None), [3, 2, 1]);
+        assert_eq!(order(Some(Aging::new(10, Priority::Normal))), [3, 2, 1]);
+        // At Urgent it is the oldest Urgent change, but not ahead of Pager.
+        assert_eq!(order(Some(Aging::new(10, Priority::Urgent))), [3, 1, 2]);
+        assert_eq!(order(Some(Aging::new(10, Priority::Pager))), [1, 3, 2]);
+        // Not yet: 100 ticks is two steps of 50, to Urgent.
+        assert_eq!(order(Some(Aging::new(50, Priority::Pager))), [3, 1, 2]);
+    }
+
+    #[test]
+    fn a_released_change_ages_from_its_release() {
+        // Bulk changes are held for a human. Released at tick 10, this one
+        // joins the back of the queue, behind web's change in flight, and
+        // waits from there: 5 ticks to rise to Normal.
+        let gate = Gate::new()
+            .with_rules(
+                r#"format 1
+                policy "bulk-waits" { defer "bulk waits for a human" when priority == bulk }"#,
+            )
+            .unwrap();
+        let admission = Admission::new(1024, RateLimit::new(64.0, 4.0));
+        let mut p = aging(
+            Floodwall::new(admission, gate),
+            Some(Aging::new(5, Priority::Normal)),
+        );
+        p.submit(apply(2, "web", Priority::Bulk, BlastRadius::Cell), 0)
+            .unwrap();
+        p.tick(0);
+        assert!(p.is_held(&IntentKey::new("bot", 2)));
+        p.submit(apply(1, "web", Priority::Normal, BlastRadius::Cell), 0)
+            .unwrap();
+        p.tick(0); // bot#1 takes web
+        p.release(&IntentKey::new("bot", 2), "ops", 10).unwrap();
+        p.submit(apply(3, "web", Priority::Normal, BlastRadius::Cell), 11)
+            .unwrap();
+        let queued = |p: &Floodwall| p.queued().map(|i| i.id).collect::<Vec<_>>();
+        assert!(p.tick(14).decisions.is_empty());
+        assert_eq!(queued(&p), [3, 2], "waited 4 ticks since its release");
+        assert!(p.tick(15).decisions.is_empty());
+        assert_eq!(queued(&p), [2, 3], "waited 5: Normal, and older than bot#3");
+        p.complete(&IntentKey::new("bot", 1), Outcome::Succeeded, 16)
+            .unwrap();
+        let report = p.tick(16);
+        assert_eq!(report.decisions[0].intent.id, 2);
+        assert_eq!(report.decisions[0].verdict, Verdict::Admit);
+        assert_eq!(report.decisions[0].released_by.as_deref(), Some("ops"));
     }
 }

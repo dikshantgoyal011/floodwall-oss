@@ -30,7 +30,8 @@
 //!
 //! # No overtaking
 //!
-//! A pass walks the queue highest priority first. When an intent is
+//! A pass walks the queue highest priority first (with aging, by the
+//! priority each intent has aged to: see [Aging](#aging)). When an intent is
 //! blocked, it keeps what it is waiting for from anything behind it in the
 //! queue, so a wide change is not starved by a stream of smaller ones:
 //!
@@ -55,10 +56,61 @@
 //! claims on its resource made by *other* agents; an agent may always
 //! follow up on its own change. A contradiction defers the intent so a
 //! human can decide which change should win.
+//!
+//! # Leases
+//!
+//! An intent in flight keeps its place until the caller reports back, so a
+//! caller that crashes, or loses track of what it was given, would keep
+//! its resource (and, with a wide intent, everything waiting on it) forever.
+//! A *lease* bounds that ([`SchedulerConfig::with_lease`]). An intent that
+//! has been in flight for the lease's ticks is *overdue*, and every
+//! [`tick`](crate::Floodwall::tick) from then on deals with it before its
+//! pass:
+//!
+//! - under [`Lease::Report`], it is reported in the tick's
+//!   [`overdue`](crate::TickReport::overdue), every tick until the caller
+//!   completes it, and keeps its place;
+//! - under [`Lease::Fail`], it *lapses*: the plane records it as
+//!   `lapsed`, as it would a failure, frees its place, and reports it in
+//!   the tick's [`lapsed`](crate::TickReport::lapsed). What was waiting on
+//!   it may start in that same pass. The caller can no longer complete it.
+//!
+//! A lapsed intent's claim stays open for the conflict window, as any
+//! completed one's does: the change may have been partly applied. Lapsing
+//! frees the resource whether or not the caller is still applying the
+//! change, so use `Fail` only where a caller that has not reported back
+//! by the end of the lease never will: one whose own timeout for applying
+//! a change is shorter than the lease, say.
+//!
+//! # Aging
+//!
+//! Priority is strict, so under a steady stream of higher-priority work,
+//! lower-priority work can wait forever: a `Bulk` change loses its
+//! resource to every newer `Normal` one queued for it, and a wide change
+//! behind a stream of narrow ones never finds the floor clear, since
+//! keeping work back only holds back what is *behind* it in the queue.
+//! *Aging* ([`SchedulerConfig::with_aging`]) bounds that. An intent that
+//! has waited in the queue for [`Aging::every`] ticks is walked one
+//! priority higher, and one higher again for every `every` ticks after
+//! that, up to [`Aging::up_to`]. Within a priority, intents are walked in
+//! the order they joined the queue, so one that has aged into a priority
+//! goes ahead of those submitted at it since; and once blocked, it keeps
+//! what it waits for from all of them (see [No overtaking](#no-overtaking)),
+//! until what holds it up completes and it starts.
+//!
+//! Aging only changes the order of the pass. The gate still sees the
+//! priority the agent asked for, and the ledger records that one, so a
+//! policy that asks for `Urgent` (such as
+//! [`BlastNeedsPriority`](crate::policy::BlastNeedsPriority)) does not let
+//! an aged `Bulk` change through: the change is only ruled on sooner. An
+//! intent at or above `up_to` does not age, so a ceiling below `Pager`
+//! keeps incident work ahead of anything that has merely waited. An intent
+//! released from hold joins the back of the queue, and ages from its
+//! release.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::intent::{Action, BlastRadius, Intent, IntentKey};
+use crate::intent::{Action, BlastRadius, Intent, IntentKey, Priority};
 
 /// The conflict window used by [`SchedulerConfig::default`], in ticks.
 pub const DEFAULT_CONFLICT_WINDOW: u64 = 10;
@@ -75,22 +127,127 @@ pub const DEFAULT_CONFLICT_WINDOW: u64 = 10;
 /// assert_eq!(config.conflict_window(), 30);
 /// assert_eq!(config.limit_for("web"), 2);
 /// assert_eq!(config.limit_for("ledger-db"), 1);
+/// assert_eq!(config.lease(), None); // in flight until the caller reports back
+/// assert_eq!(config.aging(), None); // strict priority
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchedulerConfig {
     conflict_window: u64,
     default_limit: usize,
     limits: BTreeMap<String, usize>,
+    lease: Option<Lease>,
+    aging: Option<Aging>,
+}
+
+/// How long an intent may be in flight before the plane deals with it, and
+/// how (see [Leases](self#leases)).
+///
+/// ```
+/// use floodwall::{Lease, SchedulerConfig};
+///
+/// // A change not reported back within 30 ticks is failed, and its
+/// // resource freed.
+/// let config = SchedulerConfig::default().with_lease(Some(Lease::Fail(30)));
+/// assert_eq!(config.lease().map(|l| l.ticks()), Some(30));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lease {
+    /// An intent in flight for this many ticks is reported in every tick
+    /// until the caller completes it.
+    Report(u64),
+    /// An intent in flight for this many ticks lapses at the next tick: it
+    /// is recorded as `lapsed` and its place freed.
+    Fail(u64),
+}
+
+impl Lease {
+    /// How many ticks an intent may be in flight before it is overdue.
+    pub fn ticks(&self) -> u64 {
+        match *self {
+            Lease::Report(ticks) | Lease::Fail(ticks) => ticks,
+        }
+    }
+}
+
+/// How waiting intents rise in priority (see [Aging](self#aging)).
+///
+/// ```
+/// use floodwall::intent::Priority;
+/// use floodwall::{Aging, SchedulerConfig};
+///
+/// // One priority higher for every 50 ticks in the queue, up to Urgent.
+/// let aging = Aging::new(50, Priority::Urgent);
+/// assert_eq!(aging.priority(Priority::Bulk, 49), Priority::Bulk);
+/// assert_eq!(aging.priority(Priority::Bulk, 50), Priority::Normal);
+/// assert_eq!(aging.priority(Priority::Bulk, 500), Priority::Urgent);
+/// assert_eq!(aging.priority(Priority::Pager, 0), Priority::Pager);
+/// let config = SchedulerConfig::default().with_aging(Some(aging));
+/// assert_eq!(config.aging(), Some(aging));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Aging {
+    every: u64,
+    up_to: Priority,
+}
+
+/// Every priority, by its rank: `PRIORITIES[p as usize] == p`.
+const PRIORITIES: [Priority; 4] = [
+    Priority::Bulk,
+    Priority::Normal,
+    Priority::Urgent,
+    Priority::Pager,
+];
+
+impl Aging {
+    /// Walk an intent one priority higher for every `every` ticks it has
+    /// waited in the queue, up to `up_to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `every` is 0.
+    pub fn new(every: u64, up_to: Priority) -> Self {
+        assert!(
+            every >= 1,
+            "intents must wait at least 1 tick to age; 0 would put everything waiting at the ceiling at once"
+        );
+        Self { every, up_to }
+    }
+
+    /// How many ticks of waiting raise an intent one priority.
+    pub fn every(&self) -> u64 {
+        self.every
+    }
+
+    /// The highest priority an intent ages to.
+    pub fn up_to(&self) -> Priority {
+        self.up_to
+    }
+
+    /// The priority a pass walks an intent submitted at `priority` once it
+    /// has waited `waited` ticks in the queue: one higher for every
+    /// [`every`](Aging::every) ticks, but never above
+    /// [`up_to`](Aging::up_to), nor below `priority`.
+    pub fn priority(&self, priority: Priority, waited: u64) -> Priority {
+        if priority >= self.up_to {
+            return priority;
+        }
+        let rank = (priority as u64)
+            .saturating_add(waited / self.every)
+            .min(self.up_to as u64);
+        PRIORITIES[rank as usize]
+    }
 }
 
 impl Default for SchedulerConfig {
-    /// A 10-tick conflict window ([`DEFAULT_CONFLICT_WINDOW`]) and one
-    /// narrow intent in flight per resource.
+    /// A 10-tick conflict window ([`DEFAULT_CONFLICT_WINDOW`]), one narrow
+    /// intent in flight per resource, no lease and no aging.
     fn default() -> Self {
         Self {
             conflict_window: DEFAULT_CONFLICT_WINDOW,
             default_limit: 1,
             limits: BTreeMap::new(),
+            lease: None,
+            aging: None,
         }
     }
 }
@@ -152,15 +309,50 @@ impl SchedulerConfig {
     pub fn conflict_window(&self) -> u64 {
         self.conflict_window
     }
+
+    /// Put intents in flight on a lease: report or fail each one once it
+    /// has been in flight for the lease's ticks (see [Leases](self#leases)).
+    /// `None`, the default, leaves an intent in flight until the caller
+    /// completes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lease is 0 ticks.
+    pub fn with_lease(mut self, lease: Option<Lease>) -> Self {
+        assert!(
+            lease.is_none_or(|l| l.ticks() >= 1),
+            "a lease must be at least 1 tick; 0 would be up before the change could be applied"
+        );
+        self.lease = lease;
+        self
+    }
+
+    /// The lease on intents in flight, if any.
+    pub fn lease(&self) -> Option<Lease> {
+        self.lease
+    }
+
+    /// Raise waiting intents in priority as they wait, so a pass walks
+    /// them sooner (see [Aging](self#aging)). `None`, the default, walks
+    /// the queue strictly by the priority each intent was submitted with.
+    pub fn with_aging(mut self, aging: Option<Aging>) -> Self {
+        self.aging = aging;
+        self
+    }
+
+    /// How waiting intents age, if they do.
+    pub fn aging(&self) -> Option<Aging> {
+        self.aging
+    }
 }
 
 /// A dispatched intent's claim on its `(resource, action)`.
-#[derive(Clone, Debug)]
-struct Claim {
-    key: IntentKey,
-    action: Action,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub(crate) key: IntentKey,
+    pub(crate) action: Action,
     /// When it completed; `None` while it is in flight.
-    done_at: Option<u64>,
+    pub(crate) done_at: Option<u64>,
 }
 
 impl Claim {
@@ -176,7 +368,7 @@ impl Claim {
 }
 
 /// An intent the gate admitted, which the caller is applying.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InFlight {
     /// The intent being applied.
     pub intent: Intent,
@@ -257,12 +449,21 @@ impl Scheduler {
     /// Start a pass over the queue at tick `now`, first dropping claims
     /// whose window has closed.
     pub(crate) fn begin(&mut self, now: u64) -> Pass {
+        self.drop_closed_claims(now);
+        Pass::default()
+    }
+
+    /// Drop the claims whose window has closed at tick `now`. A pass does
+    /// this first; a change of settings does it too, under the old window,
+    /// so a wider window never revives a claim a live plane may already
+    /// have dropped in a pass that recorded nothing (and a replay never
+    /// sees).
+    pub(crate) fn drop_closed_claims(&mut self, now: u64) {
         let window = self.config.conflict_window;
         self.claims.retain(|_, claims| {
             claims.retain(|c| c.is_open(now, window));
             !claims.is_empty()
         });
-        Pass::default()
     }
 
     /// Whether another agent's contradictory change to `intent`'s resource
@@ -418,6 +619,92 @@ impl Scheduler {
     /// Whether `key` is in flight.
     pub(crate) fn is_in_flight(&self, key: &IntentKey) -> bool {
         self.in_flight.contains_key(key)
+    }
+
+    /// Everything in flight past its lease at tick `now`, ordered by intent
+    /// key: in flight since `now - ticks` or earlier. Nothing without a
+    /// lease.
+    pub(crate) fn overdue(&self, now: u64) -> impl Iterator<Item = &InFlight> {
+        let ticks = self.config.lease.map(|l| l.ticks());
+        self.in_flight
+            .values()
+            .filter(move |f| ticks.is_some_and(|t| now >= f.since.saturating_add(t)))
+    }
+
+    /// Every resource's claims, by resource, each in the order they were
+    /// made, for a [snapshot](crate::snapshot).
+    pub(crate) fn claims(&self) -> Vec<(String, Vec<Claim>)> {
+        let mut claims: Vec<(String, Vec<Claim>)> = self
+            .claims
+            .iter()
+            .map(|(resource, claims)| (resource.clone(), claims.clone()))
+            .collect();
+        claims.sort_by(|a, b| a.0.cmp(&b.0));
+        claims
+    }
+
+    /// Take up what a [snapshot](crate::snapshot) kept, in place of what
+    /// is in flight and claimed, keeping the configuration. Fails, changing
+    /// nothing, unless it is a state the scheduler could be in: every
+    /// intent in flight under its own key with one open claim on its
+    /// resource, every open claim's intent in flight, and at most one wide
+    /// intent in flight.
+    pub(crate) fn restore(
+        &mut self,
+        in_flight: &[InFlight],
+        claims: &[(String, Vec<Claim>)],
+    ) -> Result<(), String> {
+        let mut flying = BTreeMap::new();
+        let mut per_resource: HashMap<String, usize> = HashMap::new();
+        let mut wide = None;
+        for f in in_flight {
+            let key = f.intent.key();
+            let resource = f.intent.action.resource().to_string();
+            if is_wide(f.intent.blast_radius) {
+                if wide.is_some() {
+                    return Err("two wide intents are in flight".into());
+                }
+                wide = Some(Wide {
+                    key: key.clone(),
+                    resource: resource.clone(),
+                    global: f.intent.blast_radius == BlastRadius::Global,
+                });
+            }
+            *per_resource.entry(resource).or_insert(0) += 1;
+            if flying.insert(key.clone(), f.clone()).is_some() {
+                return Err(format!("{key} is in flight twice"));
+            }
+        }
+        let mut open = 0;
+        let mut by_resource = HashMap::new();
+        for (resource, list) in claims {
+            if list.is_empty() || by_resource.contains_key(resource) {
+                return Err(format!(
+                    "the claims on {resource:?} are not ones a plane keeps"
+                ));
+            }
+            for claim in list.iter().filter(|c| c.done_at.is_none()) {
+                let fits = flying.get(&claim.key).is_some_and(|f: &InFlight| {
+                    f.intent.action == claim.action && f.intent.action.resource() == resource
+                });
+                if !fits {
+                    return Err(format!(
+                        "{} claims {resource:?} but is not in flight",
+                        claim.key
+                    ));
+                }
+                open += 1;
+            }
+            by_resource.insert(resource.clone(), list.clone());
+        }
+        if open != flying.len() {
+            return Err("an intent in flight has no claim on its resource".into());
+        }
+        self.in_flight = flying;
+        self.per_resource = per_resource;
+        self.wide = wide;
+        self.claims = by_resource;
+        Ok(())
     }
 }
 
@@ -615,6 +902,73 @@ mod tests {
     #[should_panic(expected = "in-flight limit must be at least 1")]
     fn a_zero_resource_limit_is_refused() {
         let _ = SchedulerConfig::default().with_limit("web", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "a lease must be at least 1 tick")]
+    fn a_zero_lease_is_refused() {
+        let _ = SchedulerConfig::default().with_lease(Some(Lease::Fail(0)));
+    }
+
+    #[test]
+    fn an_intent_is_overdue_once_in_flight_for_its_lease() {
+        let lease = |l| Scheduler::new(SchedulerConfig::default().with_lease(l));
+        let overdue = |s: &Scheduler, now| s.overdue(now).map(|f| f.intent.id).collect::<Vec<_>>();
+        for l in [Lease::Report(3), Lease::Fail(3)] {
+            let mut s = lease(Some(l));
+            s.start(intent(1, "web", Cell), 2);
+            s.start(intent(2, "api", Cell), 4);
+            s.start(intent(3, "db", Cell), 5);
+            assert!(overdue(&s, 4).is_empty());
+            assert_eq!(overdue(&s, 5), [1], "{l:?}: in flight for 3 ticks");
+            assert_eq!(overdue(&s, 8), [1, 2, 3], "{l:?}: in key order");
+            finish(&mut s, 2);
+            assert_eq!(overdue(&s, 8), [1, 3], "{l:?}: completed is not overdue");
+        }
+        // No lease: never overdue. A huge one does not overflow.
+        let mut s = lease(None);
+        s.start(intent(1, "web", Cell), 0);
+        assert!(overdue(&s, u64::MAX).is_empty());
+        let mut s = lease(Some(Lease::Fail(u64::MAX)));
+        s.start(intent(1, "web", Cell), 7);
+        assert!(overdue(&s, u64::MAX - 1).is_empty());
+        assert_eq!(overdue(&s, u64::MAX), [1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "intents must wait at least 1 tick to age")]
+    fn aging_every_zero_ticks_is_refused() {
+        let _ = Aging::new(0, Priority::Pager);
+    }
+
+    #[test]
+    fn an_intent_ages_one_priority_per_period_up_to_the_ceiling() {
+        use Priority::*;
+        let aged = |every, up_to, from, waited| Aging::new(every, up_to).priority(from, waited);
+        // One step per full period, none before.
+        let steps: Vec<Priority> = [0, 2, 3, 5, 6, 8, 9, 100]
+            .into_iter()
+            .map(|waited| aged(3, Pager, Bulk, waited))
+            .collect();
+        assert_eq!(
+            steps,
+            [Bulk, Bulk, Normal, Normal, Urgent, Urgent, Pager, Pager]
+        );
+        // Never above the ceiling, never below where it started.
+        assert_eq!(aged(1, Urgent, Bulk, 1_000), Urgent);
+        assert_eq!(aged(1, Normal, Urgent, 1_000), Urgent);
+        assert_eq!(aged(1, Normal, Normal, 1_000), Normal);
+        assert_eq!(aged(1, Bulk, Bulk, 1_000), Bulk);
+        assert_eq!(aged(5, Pager, Urgent, 4), Urgent);
+        assert_eq!(aged(5, Pager, Urgent, 5), Pager);
+        // Waits as long as a u64 does not overflow.
+        assert_eq!(aged(1, Pager, Bulk, u64::MAX), Pager);
+        assert_eq!(aged(u64::MAX, Pager, Bulk, u64::MAX - 1), Bulk);
+        assert_eq!(aged(u64::MAX, Pager, Bulk, u64::MAX), Normal);
+        // The table of priorities is in rank order.
+        for p in PRIORITIES {
+            assert_eq!(PRIORITIES[p as usize], p);
+        }
     }
 
     #[test]

@@ -116,14 +116,22 @@ impl Bucket {
         }
     }
 
+    /// Take a token at `now` if the bucket, refilled to `now`, has one. A
+    /// refused attempt leaves the bucket exactly as it was: the refill is
+    /// only kept with the token it pays for. So the bucket depends only on
+    /// the intents that got in (each recorded in the ledger), not on
+    /// attempts that were turned away, and refilling once over many ticks
+    /// is the same floating-point sum however many attempts came between.
     fn try_take(&mut self, limit: RateLimit, now: u64) -> bool {
-        if now > self.last {
+        let tokens = if now > self.last {
             let elapsed = (now - self.last) as f64;
-            self.tokens = (self.tokens + elapsed * limit.refill_per_tick).min(limit.burst);
-            self.last = now;
-        }
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+            (self.tokens + elapsed * limit.refill_per_tick).min(limit.burst)
+        } else {
+            self.tokens
+        };
+        if tokens >= 1.0 {
+            self.tokens = tokens - 1.0;
+            self.last = self.last.max(now);
             true
         } else {
             false
@@ -150,8 +158,11 @@ pub enum Rejected {
     /// The queue is at capacity - backpressure, come back later.
     Backpressure,
     /// An intent with the same agent and id is already live (queued, in
-    /// flight, or held). Returned by [`Floodwall::submit`](crate::Floodwall::submit);
-    /// [`Admission`] itself does not track identity.
+    /// flight, or held), or, on a plane with a keyring, the id is not above
+    /// the highest id already queued for the agent: ids are monotonic per
+    /// agent, so it is a replay. Returned by
+    /// [`Floodwall::submit`](crate::Floodwall::submit); [`Admission`] itself
+    /// does not track identity.
     Duplicate,
     /// The plane requires signed intents and this one carries no signature.
     /// Returned by [`Floodwall::submit`](crate::Floodwall::submit) with a
@@ -166,12 +177,33 @@ pub enum Rejected {
 
 /// An intent's place in the queue. Keys sort in processing order: highest
 /// priority first (hence `Reverse`), then submission order within a
-/// priority (FIFO). The scheduler walks the queue in this order and can
+/// priority (FIFO). The scheduler walks the queue in this order, or in the
+/// order its aging gives (see [Aging](crate::scheduler#aging)), and can
 /// take an intent from anywhere in it, which a heap cannot do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct QueueKey {
     priority: Reverse<Priority>,
     seq: u64,
+    /// The tick the intent joined the queue. `seq` is unique, so this never
+    /// decides the order of two keys.
+    since: u64,
+}
+
+impl QueueKey {
+    /// The priority the intent was submitted with.
+    pub(crate) fn priority(&self) -> Priority {
+        self.priority.0
+    }
+
+    /// Where the intent joined the queue: later joins have higher numbers.
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The tick the intent joined the queue.
+    pub(crate) fn since(&self) -> u64 {
+        self.since
+    }
 }
 
 /// The front door: per-agent rate limiting in front of a bounded priority queue.
@@ -214,6 +246,17 @@ impl Admission {
             prune_at: MIN_PRUNE_AT,
             clock: 0,
         }
+    }
+
+    /// Change every agent's rate limit from now on (see
+    /// [`crate::reconfigure`]). Each agent keeps the tokens it has saved,
+    /// up to the new burst. The caller has validated `limit`.
+    pub(crate) fn set_rate_limit(&mut self, limit: RateLimit) {
+        debug_assert!(limit.validate().is_ok());
+        for bucket in self.buckets.values_mut() {
+            bucket.tokens = bucket.tokens.min(limit.burst);
+        }
+        self.limit = limit;
     }
 
     /// Advance the clock to `now` and return the effective time: `now`, or
@@ -277,28 +320,31 @@ impl Admission {
         if !bucket.try_take(limit, now) {
             return Err(Rejected::RateLimited);
         }
-        self.enqueue(intent);
+        self.enqueue(intent, now);
         Ok(())
     }
 
     /// Put an intent that already passed admission back in the queue, e.g.
-    /// one released from hold. It goes to the back of its priority class
-    /// and does not touch the agent's rate limit, but is still refused with
-    /// [`Rejected::Backpressure`] when the queue is full.
+    /// one released from hold. It goes to the back of its priority class,
+    /// joining the queue anew at `now`, and does not touch the agent's rate
+    /// limit, but is still refused with [`Rejected::Backpressure`] when the
+    /// queue is full.
     pub(crate) fn requeue(&mut self, intent: Intent, now: u64) -> Result<(), Rejected> {
-        self.advance(now);
+        let now = self.advance(now);
         if self.is_full() {
             return Err(Rejected::Backpressure);
         }
-        self.enqueue(intent);
+        self.enqueue(intent, now);
         Ok(())
     }
 
-    /// Put an intent at the back of its priority class.
-    fn enqueue(&mut self, intent: Intent) {
+    /// Put an intent at the back of its priority class, joining the queue
+    /// at `now`.
+    fn enqueue(&mut self, intent: Intent, now: u64) {
         let key = QueueKey {
             priority: Reverse(intent.priority),
             seq: self.seq,
+            since: now,
         };
         self.seq += 1;
         self.queue.insert(key, intent);
@@ -346,6 +392,90 @@ impl Admission {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Everything the controller tracks, for a [snapshot](crate::snapshot).
+    pub(crate) fn state(&self) -> AdmissionState {
+        let mut buckets: Vec<(AgentId, f64, u64)> = self
+            .buckets
+            .iter()
+            .map(|(agent, b)| (agent.clone(), b.tokens, b.last))
+            .collect();
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        AdmissionState {
+            seq: self.seq,
+            prune_at: self.prune_at as u64,
+            clock: self.clock,
+            queue: self
+                .queue
+                .iter()
+                .map(|(key, intent)| (key.seq, key.since, intent.clone()))
+                .collect(),
+            buckets,
+        }
+    }
+
+    /// Take up `state` in place of what the controller tracks, keeping its
+    /// capacity and rate limit. Fails, changing nothing, if it holds more
+    /// than the capacity, or is not a state a controller could be in.
+    pub(crate) fn restore(&mut self, state: &AdmissionState) -> Result<(), String> {
+        if state.queue.len() > self.capacity {
+            return Err(format!(
+                "{} intents are queued, but the queue holds at most {}",
+                state.queue.len(),
+                self.capacity
+            ));
+        }
+        let mut queue = BTreeMap::new();
+        for (seq, since, intent) in &state.queue {
+            let key = QueueKey {
+                priority: Reverse(intent.priority),
+                seq: *seq,
+                since: *since,
+            };
+            if *seq >= state.seq || queue.insert(key, intent.clone()).is_some() {
+                return Err(format!("queue position {seq} is out of place"));
+            }
+        }
+        let mut buckets = HashMap::new();
+        for (agent, tokens, last) in &state.buckets {
+            if !tokens.is_finite() || buckets.contains_key(agent) {
+                return Err(format!(
+                    "{agent}'s rate-limit bucket is not one a plane keeps"
+                ));
+            }
+            buckets.insert(
+                agent.clone(),
+                Bucket {
+                    tokens: *tokens,
+                    last: *last,
+                },
+            );
+        }
+        let prune_at =
+            usize::try_from(state.prune_at).map_err(|_| "prune_at is too large".to_string())?;
+        self.queue = queue;
+        self.seq = state.seq;
+        self.prune_at = prune_at;
+        self.clock = state.clock;
+        self.buckets = buckets;
+        Ok(())
+    }
+}
+
+/// What a [snapshot](crate::snapshot) keeps of an [`Admission`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AdmissionState {
+    /// The position the next intent to join the queue takes.
+    pub(crate) seq: u64,
+    /// How many agents' buckets it may track before pruning idle ones.
+    pub(crate) prune_at: u64,
+    pub(crate) clock: u64,
+    /// Each queued intent, in queue order, with its position and the tick
+    /// it joined at.
+    pub(crate) queue: Vec<(u64, u64, Intent)>,
+    /// Each tracked agent's bucket, by agent: its tokens and the tick they
+    /// were counted at.
+    pub(crate) buckets: Vec<(AgentId, f64, u64)>,
 }
 
 #[cfg(test)]
@@ -384,6 +514,43 @@ mod tests {
             a.submit(intent_for("bot", 5, Priority::Normal), 1),
             Err(Rejected::RateLimited)
         );
+    }
+
+    #[test]
+    fn refused_attempts_leave_the_bucket_alone() {
+        // Ten refills of 0.1 summed one at a time come to 0.9999999999999999,
+        // short of a token; one refill over ten ticks is exactly 1.0. A
+        // bucket that kept each refused attempt's refill would turn the
+        // eleventh intent away; this one admits it either way.
+        let limit = RateLimit::new(1.0, 0.1);
+        let mut probed = Admission::new(100, limit);
+        let mut quiet = Admission::new(100, limit);
+        for a in [&mut probed, &mut quiet] {
+            a.submit(intent_for("bot", 0, Priority::Normal), 0).unwrap();
+        }
+        for (n, now) in (1..10).enumerate() {
+            assert_eq!(
+                probed.submit(intent_for("bot", 100 + n as u64, Priority::Normal), now),
+                Err(Rejected::RateLimited)
+            );
+        }
+        assert_eq!(
+            (0..10).map(|_| 0.1).sum::<f64>(),
+            0.9999999999999999,
+            "why it matters"
+        );
+        for a in [&mut probed, &mut quiet] {
+            assert_eq!(a.submit(intent_for("bot", 1, Priority::Normal), 10), Ok(()));
+            assert_eq!(
+                a.submit(intent_for("bot", 2, Priority::Normal), 10),
+                Err(Rejected::RateLimited)
+            );
+        }
+        let bucket = |a: &Admission| {
+            let b = &a.buckets[&AgentId::new("bot")];
+            (b.tokens.to_bits(), b.last)
+        };
+        assert_eq!(bucket(&probed), bucket(&quiet));
     }
 
     #[test]
@@ -639,6 +806,30 @@ mod tests {
         a.dequeue();
         a.requeue(intent_for("x", 3, Priority::Normal), 9).unwrap();
         assert_eq!(a.clock(), 9);
+    }
+
+    #[test]
+    fn positions_remember_when_they_joined_the_queue() {
+        let mut a = Admission::new(10, RateLimit::new(100.0, 0.0));
+        a.submit(intent_for("x", 0, Priority::Bulk), 5).unwrap();
+        // Tick 3 is tick 5: the clock never goes back.
+        a.submit(intent_for("x", 1, Priority::Pager), 3).unwrap();
+        a.requeue(intent_for("x", 2, Priority::Normal), 9).unwrap();
+        a.requeue(intent_for("x", 3, Priority::Normal), 2).unwrap();
+        let joined: Vec<(Priority, u64, u64)> = a
+            .queued_keys()
+            .iter()
+            .map(|k| (k.priority(), k.seq(), k.since()))
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                (Priority::Pager, 1, 5),
+                (Priority::Normal, 2, 9),
+                (Priority::Normal, 3, 9),
+                (Priority::Bulk, 0, 5),
+            ]
+        );
     }
 
     #[test]

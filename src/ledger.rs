@@ -16,22 +16,43 @@
 //! so field boundaries are unambiguous (`"ab" + "c"` never hashes like
 //! `"a" + "bc"`).
 //!
-//! 1. the field `floodwall/ledger/record/v2` (domain separation, so a record
+//! 1. the field `floodwall/ledger/record/v4` (domain separation, so a record
 //!    digest is never mistaken for any other hash the crate computes);
 //! 2. `prev`: the previous record's digest, 32 bytes ([`Digest::GENESIS`],
 //!    all zeros, for the first record);
 //! 3. `seq` as a `u64`;
-//! 4. `intent_id` as a `u64`;
-//! 5. the intent's [digest](crate::Intent::digest): the byte `0` if the
+//! 4. `tick` as a `u64`;
+//! 5. `intent_id` as a `u64`;
+//! 6. the intent's [digest](crate::Intent::digest): the byte `0` if the
 //!    record is not about an intent, or the byte `1` followed by the 32-byte
 //!    digest of [`Record::intent`];
-//! 6. the intent's signature: the byte `0` if there is none, or the byte `1`
+//! 7. the intent's signature: the byte `0` if there is none, or the byte `1`
 //!    followed by the 64-byte signature;
-//! 7. the fields `agent`, `verdict` and `evidence.action`, as UTF-8;
-//! 8. `evidence.reason`: the byte `0` if there is none, or the byte `1`
+//! 8. the fields `agent`, `verdict` and `evidence.action`, as UTF-8;
+//! 9. `evidence.reason`: the byte `0` if there is none, or the byte `1`
 //!    followed by the reason as a field;
-//! 9. the number of `evidence.policies` as a `u64`, then for each, its name
-//!    and its label as fields.
+//! 10. the number of `evidence.policies` as a `u64`, then for each, its name
+//!     and its label as fields;
+//! 11. the number of `evidence.bundles` as a `u64`, then for each, its name
+//!     and its revision as fields, then its 32-byte digest.
+//!
+//! # Policy bundles
+//!
+//! A decision records the policy bundles its gate's rules came from
+//! ([`Evidence::bundles`]; see [Bundles](crate::rules#bundles)): each
+//! bundle's name, its revision, and the SHA-256 of its file. They are
+//! covered by the record's digest, so which revision of which rules decided
+//! a change can be no more rewritten than the verdict. A record that is not
+//! a decision (an arrival, a release, an expiry, an outcome) records none.
+//!
+//! # Time
+//!
+//! Every record carries the logical tick it was written at
+//! ([`Record::tick`]): the ledger's clock ([`Ledger::clock`]), which only
+//! moves forward ([`Ledger::advance_clock`]). A [`Floodwall`](crate::Floodwall)
+//! keeps it at the plane's own clock, so each decision, release, expiry and
+//! outcome shows when it happened. Ticks never decrease along the chain, and
+//! [`Ledger::verify`] refuses a ledger where they do.
 //!
 //! # Signatures
 //!
@@ -47,6 +68,32 @@
 //! verified record proves its agent asked for exactly the change the record
 //! shows: changing what an agent asked for, attributing it to another agent,
 //! or claiming it asked for something it never signed, all fail.
+//!
+//! # Starting at a checkpoint
+//!
+//! A ledger normally holds every record from genesis. One made with
+//! [`Ledger::starting_at`] holds only the records after a [`Checkpoint`]:
+//! the checkpoint stands in for everything before it, as it does for an
+//! auditor with [`audit_suffix`](crate::checkpoint::audit_suffix). It is how
+//! a plane resumed from a [snapshot](crate::snapshot) keeps its ledger
+//! without the history the snapshot already summarises.
+//!
+//! Such a ledger carries on exactly as the whole one would: new records take
+//! the next position after the checkpoint and link to its head, and
+//! checkpoints, automatic or not, extend the checkpoint's Merkle frontier, so
+//! they come out as the whole ledger's would. What changes is what it can
+//! show of the past:
+//!
+//! - [`Ledger::records`], [`Ledger::len`] and [`Ledger::is_empty`] are about
+//!   the records it holds, the ones after the checkpoint; [`Ledger::size`]
+//!   counts every record, before the checkpoint too.
+//! - [`Ledger::checkpoints`] starts with the checkpoint it starts at.
+//! - [`Ledger::verify`] checks the chain from the checkpoint's head,
+//!   frontier and tick, and [`Ledger::verify_signatures`] the records it
+//!   holds.
+//! - [`Ledger::prove_inclusion`] proves only records after the checkpoint.
+//! - [`Ledger::export_jsonl`] writes a suffix export from the checkpoint
+//!   (see [`crate::export`]).
 
 use std::fmt;
 
@@ -57,6 +104,7 @@ use crate::export::{checkpoint_line, record_line};
 use crate::intent::Intent;
 use crate::keyring::Keyring;
 use crate::merkle::{self, Frontier};
+use crate::rules::BundleId;
 use crate::sha256::Sha256;
 
 /// A SHA-256 digest: one record's fingerprint, or the head of the chain.
@@ -90,7 +138,7 @@ impl fmt::Debug for Digest {
     }
 }
 
-const RECORD_DOMAIN: &[u8] = b"floodwall/ledger/record/v2";
+const RECORD_DOMAIN: &[u8] = b"floodwall/ledger/record/v4";
 
 /// Feed one variable-length field: its length, then its bytes.
 fn field(h: &mut Sha256, bytes: &[u8]) {
@@ -107,6 +155,9 @@ pub struct Evidence {
     pub reason: Option<String>,
     /// Each policy's name and its verdict label, in evaluation order.
     pub policies: Vec<(String, String)>,
+    /// For a decision, the policy bundles its gate's rules came from, in
+    /// the order the gate loaded them (see [Policy bundles](self#policy-bundles)).
+    pub bundles: Vec<BundleId>,
 }
 
 /// One immutable decision in the chain.
@@ -114,6 +165,9 @@ pub struct Evidence {
 pub struct Record {
     /// Position in the chain, from 0.
     pub seq: u64,
+    /// The logical tick it was written at: never less than the tick of the
+    /// record before it (see [Time](self#time)).
+    pub tick: u64,
     /// The intent that was ruled on.
     pub intent_id: u64,
     /// The intent itself, as its agent submitted (and signed) it, for a
@@ -124,7 +178,8 @@ pub struct Record {
     pub agent: String,
     /// What happened to the intent. A decision is `admit`, `defer` (held)
     /// or `reject`; afterwards an admitted intent is `succeeded` or
-    /// `failed`, and a held one is `released` or `expired`.
+    /// `failed`, or `lapsed` past its lease, and a held one is `released`
+    /// or `expired`.
     pub verdict: String,
     /// What the change was and why it got this verdict.
     pub evidence: Evidence,
@@ -142,6 +197,7 @@ impl Record {
         field(&mut h, RECORD_DOMAIN);
         h.update(self.prev.as_bytes());
         h.update(&self.seq.to_le_bytes());
+        h.update(&self.tick.to_le_bytes());
         h.update(&self.intent_id.to_le_bytes());
         match self.intent_digest() {
             None => h.update(&[0]),
@@ -171,6 +227,12 @@ impl Record {
         for (name, label) in &self.evidence.policies {
             field(&mut h, name.as_bytes());
             field(&mut h, label.as_bytes());
+        }
+        h.update(&(self.evidence.bundles.len() as u64).to_le_bytes());
+        for bundle in &self.evidence.bundles {
+            field(&mut h, bundle.name.as_bytes());
+            field(&mut h, bundle.revision.as_bytes());
+            h.update(bundle.digest.as_bytes());
         }
         Digest(h.finalize())
     }
@@ -245,6 +307,11 @@ impl std::error::Error for SignatureError {}
 /// ([`Ledger::create`], [`Ledger::open`]; see [`crate::durable`]), where
 /// every record and checkpoint is written, and synced, before it is added.
 pub struct Ledger {
+    /// The checkpoint the ledger starts at, if not genesis (see
+    /// [Starting at a checkpoint](self#starting-at-a-checkpoint)), and the
+    /// tick of its last record.
+    start: Option<(Checkpoint, u64)>,
+    /// The records held: every record, or those after `start`.
     records: Vec<Record>,
     head: Digest,
     /// The Merkle frontier over every record digest so far.
@@ -256,6 +323,8 @@ pub struct Ledger {
     signer: Option<SigningKey>,
     /// The file the ledger is kept in, if it is on disk.
     storage: Option<Storage>,
+    /// The tick the next record is written at; see [Time](self#time).
+    clock: u64,
 }
 
 /// Stop: a ledger on disk could not be written, so whether the latest
@@ -279,6 +348,7 @@ impl Ledger {
     /// An empty ledger, whose head is [`Digest::GENESIS`].
     pub fn new() -> Self {
         Self {
+            start: None,
             records: Vec::new(),
             head: Digest::GENESIS,
             frontier: Frontier::new(),
@@ -286,7 +356,72 @@ impl Ledger {
             checkpoint_every: None,
             signer: None,
             storage: None,
+            clock: 0,
         }
+    }
+
+    /// A ledger that starts at `checkpoint` instead of genesis: it holds no
+    /// record, and the next one it is given is record `checkpoint.size`,
+    /// linked to `checkpoint.head`, at tick `tick` or later (see
+    /// [Starting at a checkpoint](self#starting-at-a-checkpoint)). `tick` is
+    /// the tick of the last record the checkpoint covers, or any later tick
+    /// the ledger's clock had reached.
+    ///
+    /// Fails if `checkpoint` is not [well formed](Checkpoint::is_well_formed).
+    /// Whether it describes the right ledger is the caller's to know: from
+    /// its signature, say, or from a [snapshot](crate::snapshot) that names
+    /// it.
+    pub fn starting_at(checkpoint: Checkpoint, tick: u64) -> Result<Ledger, String> {
+        if !checkpoint.is_well_formed() {
+            return Err(format!(
+                "checkpoint {} is not well formed: its frontier does not fold to its root",
+                checkpoint.size
+            ));
+        }
+        let frontier = Frontier::from_parts(checkpoint.size, checkpoint.frontier.clone())
+            .expect("checked well-formed above");
+        Ok(Self {
+            head: checkpoint.head,
+            frontier,
+            checkpoints: vec![checkpoint.clone()],
+            clock: tick,
+            start: Some((checkpoint, tick)),
+            ..Self::new()
+        })
+    }
+
+    /// The checkpoint this ledger starts at, if it was made with
+    /// [`Ledger::starting_at`].
+    pub fn start(&self) -> Option<&Checkpoint> {
+        self.start.as_ref().map(|(c, _)| c)
+    }
+
+    /// How many records come before the first one held: the size of the
+    /// checkpoint the ledger starts at, or 0.
+    fn base(&self) -> u64 {
+        self.start.as_ref().map_or(0, |(c, _)| c.size)
+    }
+
+    /// How many records the ledger has, counting those before the
+    /// checkpoint it starts at: the position the next record takes. The
+    /// same as [`Ledger::len`] for a ledger that starts at genesis.
+    pub fn size(&self) -> u64 {
+        self.base() + self.records.len() as u64
+    }
+
+    /// The tick the next record will carry: the latest tick passed to
+    /// [`Ledger::advance_clock`], or the tick of the latest record read
+    /// back, and 0 for a new ledger.
+    pub fn clock(&self) -> u64 {
+        self.clock
+    }
+
+    /// Move the clock forward to `now`, so the records written from now on
+    /// carry it. A `now` earlier than the clock leaves it as it is: time
+    /// never moves backwards along the chain. Returns the clock.
+    pub fn advance_clock(&mut self, now: u64) -> u64 {
+        self.clock = self.clock.max(now);
+        self.clock
     }
 
     /// Cut a [`Checkpoint`] automatically every `every` records.
@@ -352,7 +487,7 @@ impl Ledger {
         reason: Option<String>,
         policies: Vec<(String, String)>,
     ) -> &Record {
-        match self.write_intent(intent, verdict, reason, policies, true) {
+        match self.write_intent(intent, verdict, reason, policies, Vec::new(), true) {
             Ok(seq) => &self.records[seq],
             Err(e) => write_failed(e),
         }
@@ -368,7 +503,43 @@ impl Ledger {
         reason: Option<String>,
         policies: Vec<(String, String)>,
     ) -> Result<&Record, WriteError> {
-        let seq = self.write_intent(intent, verdict, reason, policies, true)?;
+        let seq = self.write_intent(intent, verdict, reason, policies, Vec::new(), true)?;
+        Ok(&self.records[seq])
+    }
+
+    /// Like [`Ledger::append_intent`], with the policy bundles the decision's
+    /// rules came from (see [Policy bundles](self#policy-bundles)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ledger is on disk and writing to it fails; see
+    /// [`Ledger::try_append_intent_with`].
+    pub fn append_intent_with(
+        &mut self,
+        intent: &Intent,
+        verdict: &str,
+        reason: Option<String>,
+        policies: Vec<(String, String)>,
+        bundles: Vec<BundleId>,
+    ) -> &Record {
+        match self.write_intent(intent, verdict, reason, policies, bundles, true) {
+            Ok(seq) => &self.records[seq],
+            Err(e) => write_failed(e),
+        }
+    }
+
+    /// Like [`Ledger::append_intent_with`], but a ledger on disk that cannot
+    /// be written returns [`WriteError`] instead of panicking. The record is
+    /// then not added.
+    pub fn try_append_intent_with(
+        &mut self,
+        intent: &Intent,
+        verdict: &str,
+        reason: Option<String>,
+        policies: Vec<(String, String)>,
+        bundles: Vec<BundleId>,
+    ) -> Result<&Record, WriteError> {
+        let seq = self.write_intent(intent, verdict, reason, policies, bundles, true)?;
         Ok(&self.records[seq])
     }
 
@@ -416,12 +587,14 @@ impl Ledger {
         verdict: &str,
         reason: Option<String>,
         policies: Vec<(String, String)>,
+        bundles: Vec<BundleId>,
         sync: bool,
     ) -> Result<usize, WriteError> {
         let evidence = Evidence {
             action: intent.action.to_string(),
             reason,
             policies,
+            bundles,
         };
         self.push(
             intent.id,
@@ -455,7 +628,8 @@ impl Ledger {
         sync: bool,
     ) -> Result<usize, WriteError> {
         let mut record = Record {
-            seq: self.records.len() as u64,
+            seq: self.size(),
+            tick: self.clock,
             intent_id,
             intent,
             agent: agent.to_string(),
@@ -521,7 +695,7 @@ impl Ledger {
     /// written returns [`WriteError`] instead of panicking. The checkpoint
     /// is then not added.
     pub fn try_checkpoint(&mut self) -> Result<Checkpoint, WriteError> {
-        let size = self.records.len() as u64;
+        let size = self.size();
         if let Some(latest) = self.checkpoints.last().filter(|c| c.size == size) {
             return Ok(latest.clone());
         }
@@ -539,13 +713,19 @@ impl Ledger {
     /// record before it, agreeing with its intent, and matching its digest.
     /// Writes nothing.
     pub(crate) fn restore_record(&mut self, r: Record) -> Result<(), String> {
-        let seq = self.records.len() as u64;
+        let seq = self.size();
         if r.seq != seq {
             return Err(format!("expected record {seq}, found record {}", r.seq));
         }
         if r.prev != self.head {
             return Err(format!(
                 "record {seq} does not link to the record before it"
+            ));
+        }
+        if r.tick < self.clock {
+            return Err(format!(
+                "record {seq} is at tick {}, before the record before it (tick {})",
+                r.tick, self.clock
             ));
         }
         if !r.agrees_with_intent() {
@@ -557,6 +737,7 @@ impl Ledger {
             return Err(format!("record {seq} does not match its digest"));
         }
         self.head = r.digest;
+        self.clock = r.tick;
         self.frontier.push(&r.digest);
         self.records.push(r);
         Ok(())
@@ -567,7 +748,7 @@ impl Ledger {
     /// earlier checkpoint, and matching the records so far. Its signature is
     /// kept as it is. Writes nothing.
     pub(crate) fn restore_checkpoint(&mut self, c: Checkpoint) -> Result<(), String> {
-        let size = self.records.len() as u64;
+        let size = self.size();
         if c.size != size {
             return Err(format!(
                 "a checkpoint of size {} after {size} records",
@@ -629,42 +810,65 @@ impl Ledger {
     /// The records after `checkpoint`: what an auditor who trusts it needs
     /// to check the rest of the ledger with
     /// [`audit_suffix`](crate::checkpoint::audit_suffix). `None` if the
-    /// checkpoint covers more records than the ledger has.
+    /// checkpoint covers more records than the ledger has, or, for a ledger
+    /// that starts at a checkpoint, fewer than that one.
     pub fn records_after(&self, checkpoint: &Checkpoint) -> Option<&[Record]> {
-        self.records.get(usize::try_from(checkpoint.size).ok()?..)
+        let from = checkpoint.size.checked_sub(self.base())?;
+        self.records.get(usize::try_from(from).ok()?..)
     }
 
     /// An inclusion proof that record `seq` is in the Merkle tree over the
     /// first `size` records (the tree a checkpoint of that size commits
     /// to). Check it with [`merkle::verify_inclusion`] against the record's
     /// digest and the checkpoint's root. `None` unless `seq < size` and
-    /// `size` is at most the number of records.
+    /// `size` is at most the number of records ([`Ledger::size`]); for a
+    /// ledger that starts at a checkpoint, also `None` unless record `seq`
+    /// comes after it.
     pub fn prove_inclusion(&self, seq: u64, size: u64) -> Option<Vec<Digest>> {
-        let records = self.records.get(..usize::try_from(size).ok()?)?;
+        let held = usize::try_from(size.checked_sub(self.base())?).ok()?;
+        let records = self.records.get(..held)?;
         let leaves: Vec<Digest> = records.iter().map(|r| r.digest).collect();
-        merkle::inclusion_proof(&leaves, usize::try_from(seq).ok()?)
+        match &self.start {
+            None => merkle::inclusion_proof(&leaves, usize::try_from(seq).ok()?),
+            Some((start, _)) => {
+                let before = Frontier::from_parts(start.size, start.frontier.clone())?;
+                merkle::inclusion_proof_after(&before, &leaves, seq)
+            }
+        }
     }
 
     /// Recompute the chain from genesis and confirm nothing has been
     /// altered: every record is at its position, links to the one before
-    /// it, agrees with the intent it holds, and has the digest its contents
-    /// give, and the last digest is the head. Every checkpoint must match
+    /// it, is at a tick no earlier than it, agrees with the intent it holds,
+    /// and has the digest its contents give, and the last digest is the
+    /// head. Every checkpoint must match
     /// the records it covers, in order. Checkpoint signatures are checked
     /// separately, with [`Ledger::verify_checkpoint_signatures`].
+    ///
+    /// A ledger that starts at a checkpoint is checked from there: from the
+    /// checkpoint's head, Merkle frontier and tick, instead of genesis.
     pub fn verify(&self) -> bool {
-        let mut prev = Digest::GENESIS;
-        let mut frontier = Frontier::new();
+        let (mut prev, mut tick, mut frontier) = match &self.start {
+            None => (Digest::GENESIS, 0, Frontier::new()),
+            Some((c, tick)) => match Frontier::from_parts(c.size, c.frontier.clone()) {
+                Some(frontier) if c.is_well_formed() => (c.head, *tick, frontier),
+                _ => return false,
+            },
+        };
+        let base = self.base();
         let mut checkpoints = self.checkpoints.iter().peekable();
         for i in 0..=self.records.len() {
+            let seq = base + i as u64;
             // Every checkpoint at this size must match the records so far.
-            while let Some(c) = checkpoints.next_if(|c| c.size == i as u64) {
+            while let Some(c) = checkpoints.next_if(|c| c.size == seq) {
                 if c.head != prev || c.root != frontier.root() || c.frontier != frontier.peaks() {
                     return false;
                 }
             }
             let Some(r) = self.records.get(i) else { break };
-            if r.seq != i as u64
+            if r.seq != seq
                 || r.prev != prev
+                || r.tick < tick
                 || !r.agrees_with_intent()
                 || r.compute_digest() != r.digest
             {
@@ -672,6 +876,7 @@ impl Ledger {
             }
             frontier.push(&r.digest);
             prev = r.digest;
+            tick = r.tick;
         }
         // Checkpoints must come in order and none may outrun the records.
         let in_order = self.checkpoints.windows(2).all(|w| w[0].size < w[1].size);
@@ -713,17 +918,21 @@ impl Ledger {
         self.head
     }
 
-    /// The recorded decisions, oldest first.
+    /// The recorded decisions, oldest first. For a ledger that starts at a
+    /// checkpoint, only those after it (see
+    /// [Starting at a checkpoint](self#starting-at-a-checkpoint)).
     pub fn records(&self) -> &[Record] {
         &self.records
     }
 
-    /// How many decisions are recorded.
+    /// How many decisions [`Ledger::records`] holds. For a ledger that
+    /// starts at a checkpoint, [`Ledger::size`] counts the ones before it
+    /// too.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Whether the ledger is empty.
+    /// Whether [`Ledger::records`] is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -772,6 +981,46 @@ mod tests {
         assert!(!l.verify());
     }
 
+    #[test]
+    fn records_carry_the_clock_which_never_goes_back() {
+        let mut l = Ledger::new();
+        assert_eq!(l.clock(), 0);
+        l.append(1, "bot", "admit");
+        assert_eq!(l.advance_clock(5), 5);
+        assert_eq!(l.advance_clock(2), 5, "an earlier tick leaves the clock");
+        l.append(2, "bot", "admit");
+        l.append(3, "bot", "admit");
+        l.advance_clock(9);
+        l.append(4, "bot", "admit");
+        let ticks: Vec<u64> = l.records().iter().map(|r| r.tick).collect();
+        assert_eq!(ticks, [0, 5, 5, 9]);
+        assert!(l.verify());
+        // The tick is covered by the digest...
+        let mut edited = l.records[1].clone();
+        edited.tick = 6;
+        assert_ne!(edited.compute_digest(), l.records[1].digest);
+        // ...and a record whose tick goes back is refused even with its
+        // digest, and every digest after it, recomputed to match.
+        l.records[2].tick = 4;
+        let mut prev = l.records[1].digest;
+        for r in &mut l.records[2..] {
+            r.prev = prev;
+            r.digest = r.compute_digest();
+            prev = r.digest;
+        }
+        l.head = prev;
+        assert!(!l.verify());
+        l.records[2].tick = 5;
+        let mut prev = l.records[1].digest;
+        for r in &mut l.records[2..] {
+            r.prev = prev;
+            r.digest = r.compute_digest();
+            prev = r.digest;
+        }
+        l.head = prev;
+        assert!(l.verify(), "equal ticks are fine");
+    }
+
     fn evidence(reason: Option<&str>) -> Evidence {
         Evidence {
             action: "destroy web".into(),
@@ -780,6 +1029,7 @@ mod tests {
                 ("no-global-destroy".into(), "reject".into()),
                 ("resource-allowlist".into(), "admit".into()),
             ],
+            bundles: vec![],
         }
     }
 
@@ -844,8 +1094,10 @@ mod tests {
                     ("no-global-destroy".into(), "admit".into()),
                     ("conflict-window".into(), "admit".into()),
                 ],
+                bundles: vec![],
             },
         );
+        l.advance_clock(3);
         l.append_with(
             2,
             "deployer",
@@ -854,10 +1106,15 @@ mod tests {
                 action: "apply billing".into(),
                 reason: Some("resource 'billing' is not on the allowlist".into()),
                 policies: vec![("resource-allowlist".into(), "defer".into())],
+                bundles: vec![],
             },
         );
         // Non-ASCII: lengths are in bytes, not characters.
         l.append(3, "opérateur", "released");
+        // A tick past 2^53, which a JSON number could not hold exactly; an
+        // earlier one afterwards changes nothing.
+        l.advance_clock(9_007_199_254_740_993);
+        l.advance_clock(2);
         l.append_with(
             3,
             "opérateur",
@@ -872,6 +1129,29 @@ mod tests {
         // the intents themselves.
         l.append_intent(&signed_intent(), "admit", None, vec![]);
         l.append_intent(&unsigned_intent(), "succeeded", None, vec![]);
+        // A decision with two policy bundles; the second's name is not
+        // ASCII, so its length in bytes is not its length in characters.
+        l.append_intent_with(
+            &unsigned_intent(),
+            "reject",
+            Some("scaling web to 3 needs a human".into()),
+            vec![
+                ("scale-bounds".into(), "reject".into()),
+                ("conflict-window".into(), "admit".into()),
+            ],
+            vec![
+                BundleId {
+                    name: "production".into(),
+                    revision: "2026.10.28-1".into(),
+                    digest: Digest(crate::sha256::sha256(b"format 1\n")),
+                },
+                BundleId {
+                    name: "\u{e9}quipe".into(),
+                    revision: "r2".into(),
+                    digest: Digest([0x5a; 32]),
+                },
+            ],
+        );
         l
     }
 
@@ -909,20 +1189,35 @@ mod tests {
     #[test]
     fn digests_follow_the_documented_encoding() {
         // Computed by an independent implementation (Node's crypto) written
-        // from the "Record encoding" section of this module's docs and the
-        // "Signing" section of `Intent`'s, with Node's Ed25519 signature.
+        // from the "Record encoding" section of this module's docs (v4) and
+        // the "Signing" section of `Intent`'s, with Node's Ed25519 signature.
         let want = [
-            "7a6771f4ee960f9a5fe1ebc497739dc56be2796637aadae8163cd85601e911af",
-            "a173989be6337d02b7e61b89ee26bd0a35dc091a4d50bf248ef8c4f0ce32cf32",
-            "42a5d402e0e778bb13e852befc5d1929393991ee41f6dec6a606c2005dae522e",
-            "312d24135327af062fdc660ce27a0ebc3a84fae9b3b7f6dbee6a085d6084d086",
-            "006b530eb9c1a079b0668a7646e282839145d59540ee26b401ea72fd51d2dd97",
-            "2af252fa07da44c62bc9f1cf9fa66a9e9eb6a28a19d718a406453a33fbd0105c",
+            "1de0ba75fa2b80b6d5b549b66ccb278ba07390629af9f6d2ae9576f78a984349",
+            "c2d38f398bd5748931944f0d44de8e38674cf7f3ffc3366ea77eed3c850b8f5d",
+            "4cd45250e147b5467d5d73563c55362583195658704cda9b31d4bdf0e390f47f",
+            "8124caf1460c3cf2ff8a51e1363349378ed56b9904ac770e4545cf68e221f9d1",
+            "077bbcd229eb9424e88cfa4a571aa743cc94cd1b841595ec9ea036a0e9982968",
+            "dbf8ea20a9124c80cfba5ba3d7e6f4a2559fab688ebe236b4f6bce32e7b9f229",
+            "dde925d2a75e213421b70f5d62a308089fb392bd9b36b9dc11e1ce907638e003",
         ];
         let l = reference_ledger();
         let got: Vec<String> = l.records().iter().map(|r| r.digest.to_string()).collect();
         assert_eq!(got, want);
-        assert_eq!(l.head().to_string(), want[5]);
+        let ticks: Vec<u64> = l.records().iter().map(|r| r.tick).collect();
+        let big = 9_007_199_254_740_993;
+        assert_eq!(ticks, [0, 3, 3, big, big, big, big]);
+        assert_eq!(l.clock(), big);
+        assert_eq!(l.head().to_string(), want[6]);
+        // The bundles are covered: the same record without them, or with
+        // one revision changed, has another digest.
+        let decision = &l.records()[6];
+        assert_eq!(decision.evidence.bundles.len(), 2);
+        let mut without = decision.clone();
+        without.evidence.bundles.clear();
+        assert_ne!(without.compute_digest(), decision.digest);
+        let mut revised = decision.clone();
+        revised.evidence.bundles[0].revision = "2026.10.28-2".into();
+        assert_ne!(revised.compute_digest(), decision.digest);
         assert!(l.verify());
         let signed = &l.records()[4];
         assert_eq!(signed.intent.as_ref(), Some(&signed_intent()));
@@ -947,7 +1242,7 @@ mod tests {
         let l = reference_ledger();
         assert_eq!(l.records()[0].prev, Digest::GENESIS);
         let d = l.records()[0].digest;
-        assert_eq!(d.as_bytes()[0], 0x7a);
+        assert_eq!(d.as_bytes()[0], 0x1d);
         assert_eq!(format!("{d:?}"), format!("Digest({d})"));
     }
 

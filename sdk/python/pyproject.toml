@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "floodwall"
+version = "0.1.0"
+description = "Ask a Floodwall Cloud plane before your agent changes production."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["floodwall", "agents", "devops", "policy", "change-management"]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+# Only for planes that require signed intents.
+signing = ["cryptography>=41"]
+
+[tool.setuptools]
+# Only the client; tests/ is not part of the package.
+packages = ["floodwall"]
+
+[project.urls]
+Repository = "https://github.com/erphq/floodwall"

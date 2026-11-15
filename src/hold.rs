@@ -11,13 +11,19 @@
 //! - [`Floodwall::expire`](crate::Floodwall::expire) drops it.
 //!
 //! Held intents also expire on their own once they have been held for the
-//! configured TTL, and the oldest is evicted when the hold queue is full.
+//! configured TTL. When the hold queue is full, the plane evicts the oldest
+//! intent of the agent holding the most, with ties going to whichever of
+//! those agents has held its oldest intent longest. So an agent that keeps
+//! deferring its own intents (for example by naming resources off the
+//! allowlist) only pushes out its own: it cannot expire another agent's
+//! intent while it holds at least as many itself. The choice depends only on
+//! what is held and in what order, so a replay makes it the same way.
 //! Every release and expiry is recorded in the ledger.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use crate::intent::{Intent, IntentKey};
+use crate::intent::{AgentId, Intent, IntentKey};
 
 /// The hold queue capacity used by [`HoldConfig::default`].
 pub const DEFAULT_HOLD_CAPACITY: usize = 1024;
@@ -48,9 +54,12 @@ impl Default for HoldConfig {
 }
 
 impl HoldConfig {
-    /// Hold at most `capacity` intents; when a new one is deferred into a
-    /// full hold, the oldest is evicted. `0` holds nothing: a deferred
-    /// intent is expired as soon as it is deferred.
+    /// Hold at most `capacity` intents. When a new one is deferred into a
+    /// full hold, the oldest intent of the agent holding the most is
+    /// evicted (ties go to the agent whose oldest intent is oldest), so one
+    /// agent's deferrals cannot push out another agent's held intents. `0`
+    /// holds nothing: a deferred intent is expired as soon as it is
+    /// deferred.
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
         self
@@ -160,18 +169,34 @@ impl Hold {
         self.trim()
     }
 
-    /// Evict the oldest held intents until the hold is within capacity.
+    /// Evict held intents until the hold is within capacity, in eviction
+    /// order. Each eviction takes the oldest intent of the agent holding the
+    /// most; among agents tied for the most, the one whose oldest intent is
+    /// oldest. That is the first entry in hold order whose agent has the
+    /// most, which is deterministic for a given hold.
     pub(crate) fn trim(&mut self) -> Vec<Held> {
         let mut evicted = Vec::new();
         while self.entries.len() > self.config.capacity {
-            let (_, held) = self
-                .entries
-                .pop_first()
-                .expect("over capacity, so not empty");
+            let slot = self.eviction_slot().expect("over capacity, so not empty");
+            let held = self.entries.remove(&slot).expect("slot just found");
             self.index.remove(&held.intent.key());
             evicted.push(held);
         }
         evicted
+    }
+
+    /// The slot [`Hold::trim`] evicts next: the first entry in hold order
+    /// whose agent holds the most entries.
+    fn eviction_slot(&self) -> Option<u64> {
+        let mut counts: HashMap<&AgentId, usize> = HashMap::new();
+        for held in self.entries.values() {
+            *counts.entry(&held.intent.agent).or_default() += 1;
+        }
+        let most = counts.values().copied().max()?;
+        self.entries
+            .iter()
+            .find(|(_, held)| counts[&held.intent.agent] == most)
+            .map(|(slot, _)| *slot)
     }
 
     /// Remove and return a held intent.
@@ -205,17 +230,53 @@ impl Hold {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Held> {
         self.entries.values()
     }
+
+    /// Every held intent with its slot, oldest first, and the slot the next
+    /// one takes, for a [snapshot](crate::snapshot).
+    pub(crate) fn slots(&self) -> (Vec<(u64, Held)>, u64) {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(slot, held)| (*slot, held.clone()))
+            .collect();
+        (entries, self.next)
+    }
+
+    /// Take up what a [snapshot](crate::snapshot) kept in place of what is
+    /// held, keeping the configuration. Fails, changing nothing, if a slot
+    /// or an intent comes twice, or a slot is not below `next`.
+    pub(crate) fn restore(&mut self, entries: &[(u64, Held)], next: u64) -> Result<(), String> {
+        let mut by_slot = BTreeMap::new();
+        let mut index = HashMap::new();
+        for (slot, held) in entries {
+            let key = held.intent.key();
+            if *slot >= next || by_slot.insert(*slot, held.clone()).is_some() {
+                return Err(format!("hold slot {slot} is out of place"));
+            }
+            if index.insert(key.clone(), *slot).is_some() {
+                return Err(format!("{key} is held twice"));
+            }
+        }
+        self.entries = by_slot;
+        self.index = index;
+        self.next = next;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent::{Action, AgentId, BlastRadius, Priority};
+    use crate::intent::{Action, BlastRadius, Priority};
 
     fn intent(id: u64) -> Intent {
+        intent_of("bot", id)
+    }
+
+    fn intent_of(agent: &str, id: u64) -> Intent {
         Intent::new(
             id,
-            AgentId::new("bot"),
+            AgentId::new(agent),
             Action::Destroy {
                 resource: "web".into(),
             },
@@ -254,6 +315,32 @@ mod tests {
         assert_eq!(ids(&evicted), [0]);
         assert_eq!(ids(h.iter()), [1, 2]);
         assert!(!h.contains(&IntentKey::new("bot", 0)));
+    }
+
+    #[test]
+    fn a_full_hold_evicts_from_the_agent_holding_the_most() {
+        let mut h = Hold::new(HoldConfig::default().with_capacity(3));
+        h.put(intent_of("victim", 0), "r".into(), 0);
+        h.put(intent_of("noisy", 1), "r".into(), 1);
+        h.put(intent_of("noisy", 2), "r".into(), 1);
+        // noisy holds the most, so its own oldest goes, not victim's.
+        assert_eq!(ids(&h.put(intent_of("noisy", 3), "r".into(), 2)), [1]);
+        assert_eq!(ids(&h.put(intent_of("noisy", 4), "r".into(), 2)), [2]);
+        assert_eq!(ids(h.iter()), [0, 3, 4]);
+        assert!(h.contains(&IntentKey::new("victim", 0)));
+    }
+
+    #[test]
+    fn a_tie_evicts_the_oldest_of_the_tied_agents() {
+        let mut h = Hold::new(HoldConfig::default().with_capacity(3));
+        h.put(intent_of("a", 0), "r".into(), 0);
+        h.put(intent_of("b", 1), "r".into(), 0);
+        h.put(intent_of("b", 2), "r".into(), 0);
+        // a and b now hold two each; a's oldest is the oldest of all.
+        assert_eq!(ids(&h.put(intent_of("a", 3), "r".into(), 1)), [0]);
+        // b holds the most again.
+        assert_eq!(ids(&h.put(intent_of("c", 4), "r".into(), 1)), [1]);
+        assert_eq!(ids(h.iter()), [2, 3, 4]);
     }
 
     #[test]

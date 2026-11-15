@@ -5,14 +5,14 @@
 //! JSON object per line, UTF-8, `\n` line endings, with exactly the keys
 //! shown below. Every object has a `"type"`. Digests, signatures and keys
 //! are lowercase hex. Integers that can exceed 2^53 (and so are not exact in
-//! every JSON parser) are written as decimal strings; counts and replica
-//! numbers are plain numbers.
+//! every JSON parser), like intent ids and ticks, are written as decimal
+//! strings; counts and replica numbers are plain numbers.
 //!
 //! **Header**, always the first line:
 //!
 //! ```text
 //! {"type":"header","format":"floodwall-ledger","version":1,"from":0,
-//!  "hash":"sha256","merkle":"rfc6962","record_encoding":"floodwall/ledger/record/v2",
+//!  "hash":"sha256","merkle":"rfc6962","record_encoding":"floodwall/ledger/record/v4",
 //!  "intent_encoding":"floodwall/intent/v1","checkpoint_encoding":"floodwall/checkpoint/v1"}
 //! ```
 //!
@@ -22,10 +22,19 @@
 //! **Record**, one per ledger record, in order (fields as in [`Record`]):
 //!
 //! ```text
-//! {"type":"record","seq":0,"intent_id":"7","agent":"deployer","verdict":"admit",
-//!  "action":"apply web","reason":"..."|null,"policies":[["name","label"],...],
+//! {"type":"record","seq":0,"tick":"12","intent_id":"7","agent":"deployer",
+//!  "verdict":"admit","action":"apply web","reason":"..."|null,
+//!  "policies":[["name","label"],...],
+//!  "bundles":[{"name":"production","revision":"2026.10.28-1","digest":"<hex>"},...],
 //!  "intent":<intent>|null,"prev":"<hex>","digest":"<hex>"}
 //! ```
+//!
+//! `tick` is the logical tick the record was written at; ticks never
+//! decrease from one record to the next (see [`crate::ledger`]).
+//!
+//! `bundles` are the policy bundles a decision's rules came from (see
+//! [Bundles](crate::rules#bundles)), in order, and `[]` for a record with
+//! none, as every record that is not a decision is.
 //!
 //! `intent` is the intent the record is about, as its agent signed it:
 //!
@@ -83,6 +92,7 @@ use crate::json::{self, Value};
 use crate::keyring::Keyring;
 use crate::ledger::{Digest, Evidence, Ledger, Record};
 use crate::merkle::Frontier;
+use crate::rules::BundleId;
 
 /// The `format` named in the header.
 pub const FORMAT: &str = "floodwall-ledger";
@@ -91,7 +101,7 @@ pub const VERSION: u64 = 1;
 
 /// Write `s` as a JSON string: quotes and backslashes escaped, control
 /// characters as escapes, everything else as UTF-8.
-fn json_str(out: &mut String, s: &str) {
+pub(crate) fn json_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -118,17 +128,40 @@ pub(crate) fn header(from: u64) -> String {
     format!(
         "{{\"type\":\"header\",\"format\":\"{FORMAT}\",\"version\":{VERSION},\"from\":{from},\
          \"hash\":\"sha256\",\"merkle\":\"rfc6962\",\
-         \"record_encoding\":\"floodwall/ledger/record/v2\",\
+         \"record_encoding\":\"floodwall/ledger/record/v4\",\
          \"intent_encoding\":\"floodwall/intent/v1\",\
          \"checkpoint_encoding\":\"floodwall/checkpoint/v1\"}}"
     )
 }
 
-fn intent_json(s: &mut String, i: &Intent) {
+pub(crate) fn intent_json(s: &mut String, i: &Intent) {
     s.push_str(&format!("{{\"id\":\"{}\",\"agent\":", i.id));
     json_str(s, i.agent.as_str());
-    s.push_str(",\"action\":{\"kind\":");
-    match &i.action {
+    s.push_str(",\"action\":");
+    action_json(s, &i.action);
+    let priority = match i.priority {
+        Priority::Bulk => "bulk",
+        Priority::Normal => "normal",
+        Priority::Urgent => "urgent",
+        Priority::Pager => "pager",
+    };
+    let blast = match i.blast_radius {
+        BlastRadius::Cell => "cell",
+        BlastRadius::Service => "service",
+        BlastRadius::Region => "region",
+        BlastRadius::Global => "global",
+    };
+    s.push_str(&format!(
+        ",\"priority\":\"{priority}\",\"blast_radius\":\"{blast}\",\"signature\":"
+    ));
+    json_opt_str(s, i.signature.map(|sig| sig.to_string()).as_deref());
+    s.push('}');
+}
+
+/// An intent's action, in the export's intent form.
+pub(crate) fn action_json(s: &mut String, action: &Action) {
+    s.push_str("{\"kind\":");
+    match action {
         Action::Apply { resource, manifest } => {
             s.push_str("\"apply\",\"resource\":");
             json_str(s, resource);
@@ -145,29 +178,13 @@ fn intent_json(s: &mut String, i: &Intent) {
             json_str(s, resource);
         }
     }
-    let priority = match i.priority {
-        Priority::Bulk => "bulk",
-        Priority::Normal => "normal",
-        Priority::Urgent => "urgent",
-        Priority::Pager => "pager",
-    };
-    let blast = match i.blast_radius {
-        BlastRadius::Cell => "cell",
-        BlastRadius::Service => "service",
-        BlastRadius::Region => "region",
-        BlastRadius::Global => "global",
-    };
-    s.push_str(&format!(
-        "}},\"priority\":\"{priority}\",\"blast_radius\":\"{blast}\",\"signature\":"
-    ));
-    json_opt_str(s, i.signature.map(|sig| sig.to_string()).as_deref());
     s.push('}');
 }
 
 pub(crate) fn record_line(r: &Record) -> String {
     let mut s = format!(
-        "{{\"type\":\"record\",\"seq\":{},\"intent_id\":\"{}\",\"agent\":",
-        r.seq, r.intent_id
+        "{{\"type\":\"record\",\"seq\":{},\"tick\":\"{}\",\"intent_id\":\"{}\",\"agent\":",
+        r.seq, r.tick, r.intent_id
     );
     json_str(&mut s, &r.agent);
     s.push_str(",\"verdict\":");
@@ -186,6 +203,17 @@ pub(crate) fn record_line(r: &Record) -> String {
         s.push(',');
         json_str(&mut s, label);
         s.push(']');
+    }
+    s.push_str("],\"bundles\":[");
+    for (i, bundle) in r.evidence.bundles.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"name\":");
+        json_str(&mut s, &bundle.name);
+        s.push_str(",\"revision\":");
+        json_str(&mut s, &bundle.revision);
+        s.push_str(&format!(",\"digest\":\"{}\"}}", bundle.digest));
     }
     s.push_str("],\"intent\":");
     match &r.intent {
@@ -217,7 +245,14 @@ impl Ledger {
     /// Write the whole ledger as JSON Lines (see [`crate::export`]): a
     /// header, then every record, with each checkpoint after the record
     /// that completes it.
+    ///
+    /// A ledger that starts at a checkpoint ([`Ledger::starting_at`]) has no
+    /// records before it to write, so it writes a suffix export from that
+    /// checkpoint, as [`Ledger::export_jsonl_from`] does.
     pub fn export_jsonl<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        if let Some(start) = self.start() {
+            return self.export_jsonl_from(start, out);
+        }
         writeln!(out, "{}", header(0))?;
         self.write_from(0, false, out)
     }
@@ -254,8 +289,9 @@ impl Ledger {
         while let Some(c) = checkpoints.next_if(|c| c.size == start) {
             writeln!(out, "{}", checkpoint_line(c))?;
         }
-        let start = usize::try_from(start).map_err(|_| io::ErrorKind::InvalidInput)?;
-        for r in self.records().get(start..).unwrap_or_default() {
+        let held = start.saturating_sub(self.size() - self.len() as u64);
+        let held = usize::try_from(held).map_err(|_| io::ErrorKind::InvalidInput)?;
+        for r in self.records().get(held..).unwrap_or_default() {
             writeln!(out, "{}", record_line(r))?;
             while let Some(c) = checkpoints.next_if(|c| c.size == r.seq + 1) {
                 writeln!(out, "{}", checkpoint_line(c))?;
@@ -264,18 +300,28 @@ impl Ledger {
         Ok(())
     }
 
-    /// Whether `c` describes this ledger at `c.size` records.
+    /// Whether `c` describes this ledger at `c.size` records. For a ledger
+    /// that starts at a checkpoint, only sizes from that one on can be
+    /// checked.
     fn matches(&self, c: &Checkpoint) -> bool {
-        let Some(records) = usize::try_from(c.size)
-            .ok()
+        let (mut head, mut frontier, base) = match self.start() {
+            None => (Digest::GENESIS, Frontier::new(), 0),
+            Some(s) => match Frontier::from_parts(s.size, s.frontier.clone()) {
+                Some(frontier) => (s.head, frontier, s.size),
+                None => return false,
+            },
+        };
+        let Some(records) = c
+            .size
+            .checked_sub(base)
+            .and_then(|n| usize::try_from(n).ok())
             .and_then(|n| self.records().get(..n))
         else {
             return false;
         };
-        let head = records.last().map_or(Digest::GENESIS, |r| r.digest);
-        let mut frontier = Frontier::new();
         for r in records {
             frontier.push(&r.digest);
+            head = r.digest;
         }
         c.head == head && c.root == frontier.root() && c.frontier == frontier.peaks()
     }
@@ -319,8 +365,11 @@ pub fn keys_json(keyring: &Keyring, plane: Option<&VerifyingKey>) -> String {
 /// One line of an export, read back by [`read_line`].
 #[derive(Debug)]
 pub(crate) enum Line {
-    Header { from: u64 },
-    Record(Record),
+    Header {
+        from: u64,
+    },
+    /// Boxed: a record is much larger than the other lines.
+    Record(Box<Record>),
     Checkpoint(Checkpoint),
 }
 
@@ -347,7 +396,7 @@ pub(crate) fn read_line(line: &str) -> Result<Line, String> {
         "record" => {
             let r = read_record(&value)?;
             let written = record_line(&r);
-            (Line::Record(r), written)
+            (Line::Record(Box::new(r)), written)
         }
         "checkpoint" => {
             let c = read_checkpoint(&value)?;
@@ -366,7 +415,11 @@ pub(crate) fn read_line(line: &str) -> Result<Line, String> {
 }
 
 /// The values of an object that has exactly the fields `names`, in order.
-fn fields<'a>(value: &'a Value, names: &[&str], what: &str) -> Result<Vec<&'a Value>, String> {
+pub(crate) fn fields<'a>(
+    value: &'a Value,
+    names: &[&str],
+    what: &str,
+) -> Result<Vec<&'a Value>, String> {
     let Value::Object(fields) = value else {
         return Err(format!("{what} is {}, not an object", value.kind()));
     };
@@ -394,21 +447,21 @@ fn fields<'a>(value: &'a Value, names: &[&str], what: &str) -> Result<Vec<&'a Va
     Ok(fields.iter().map(|(_, v)| v).collect())
 }
 
-fn string<'a>(value: &'a Value, what: &str) -> Result<&'a str, String> {
+pub(crate) fn string<'a>(value: &'a Value, what: &str) -> Result<&'a str, String> {
     match value {
         Value::String(s) => Ok(s),
         other => Err(format!("{what} is {}, not a string", other.kind())),
     }
 }
 
-fn opt_string(value: &Value, what: &str) -> Result<Option<String>, String> {
+pub(crate) fn opt_string(value: &Value, what: &str) -> Result<Option<String>, String> {
     match value {
         Value::Null => Ok(None),
         other => string(other, what).map(|s| Some(s.to_string())),
     }
 }
 
-fn number(value: &Value, what: &str) -> Result<u64, String> {
+pub(crate) fn number(value: &Value, what: &str) -> Result<u64, String> {
     match value {
         Value::Number(n) => Ok(*n),
         other => Err(format!("{what} is {}, not a number", other.kind())),
@@ -416,7 +469,7 @@ fn number(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// A `u64` written as a decimal string, the way `intent_id` is.
-fn decimal(value: &Value, what: &str) -> Result<u64, String> {
+pub(crate) fn decimal(value: &Value, what: &str) -> Result<u64, String> {
     let s = string(value, what)?;
     let canonical = s == "0" || (!s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()));
     match s.parse::<u64>() {
@@ -426,7 +479,7 @@ fn decimal(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// `N` bytes written as lowercase hex.
-fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
+pub(crate) fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
     let s = string(value, what)?;
     let digit = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -478,7 +531,7 @@ fn read_header(value: &Value) -> Result<u64, String> {
     for (value, name, expected) in [
         (f[4], "hash", "sha256"),
         (f[5], "merkle", "rfc6962"),
-        (f[6], "record_encoding", "floodwall/ledger/record/v2"),
+        (f[6], "record_encoding", "floodwall/ledger/record/v4"),
         (f[7], "intent_encoding", "floodwall/intent/v1"),
         (f[8], "checkpoint_encoding", "floodwall/checkpoint/v1"),
     ] {
@@ -490,7 +543,7 @@ fn read_header(value: &Value) -> Result<u64, String> {
     Ok(from)
 }
 
-fn read_intent(value: &Value) -> Result<Intent, String> {
+pub(crate) fn read_intent(value: &Value) -> Result<Intent, String> {
     let f = fields(
         value,
         &[
@@ -503,38 +556,7 @@ fn read_intent(value: &Value) -> Result<Intent, String> {
         ],
         "intent",
     )?;
-    let kind = match f[2] {
-        Value::Object(fields) => match fields.first() {
-            Some((key, Value::String(kind))) if key == "kind" => kind.as_str(),
-            _ => "",
-        },
-        _ => "",
-    };
-    let action = match kind {
-        "apply" => {
-            let a = fields(f[2], &["kind", "resource", "manifest"], "intent.action")?;
-            Action::Apply {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-                manifest: string(a[2], "intent.action.manifest")?.to_string(),
-            }
-        }
-        "scale" => {
-            let a = fields(f[2], &["kind", "resource", "replicas"], "intent.action")?;
-            let replicas = number(a[2], "intent.action.replicas")?;
-            Action::Scale {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-                replicas: u32::try_from(replicas)
-                    .map_err(|_| "intent.action.replicas is not a u32".to_string())?,
-            }
-        }
-        "destroy" => {
-            let a = fields(f[2], &["kind", "resource"], "intent.action")?;
-            Action::Destroy {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-            }
-        }
-        _ => return Err("intent.action.kind is not \"apply\", \"scale\" or \"destroy\"".into()),
-    };
+    let action = read_action(f[2], "intent.action")?;
     let priority = match string(f[3], "intent.priority")? {
         "bulk" => Priority::Bulk,
         "normal" => Priority::Normal,
@@ -559,26 +581,68 @@ fn read_intent(value: &Value) -> Result<Intent, String> {
     })
 }
 
+/// An action in the export's intent form; `what` names it in errors.
+pub(crate) fn read_action(value: &Value, what: &str) -> Result<Action, String> {
+    let kind = match value {
+        Value::Object(fields) => match fields.first() {
+            Some((key, Value::String(kind))) if key == "kind" => kind.as_str(),
+            _ => "",
+        },
+        _ => "",
+    };
+    Ok(match kind {
+        "apply" => {
+            let a = fields(value, &["kind", "resource", "manifest"], what)?;
+            Action::Apply {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+                manifest: string(a[2], &format!("{what}.manifest"))?.to_string(),
+            }
+        }
+        "scale" => {
+            let a = fields(value, &["kind", "resource", "replicas"], what)?;
+            let replicas = number(a[2], &format!("{what}.replicas"))?;
+            Action::Scale {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+                replicas: u32::try_from(replicas)
+                    .map_err(|_| format!("{what}.replicas is not a u32"))?,
+            }
+        }
+        "destroy" => {
+            let a = fields(value, &["kind", "resource"], what)?;
+            Action::Destroy {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{what}.kind is not \"apply\", \"scale\" or \"destroy\""
+            ))
+        }
+    })
+}
+
 fn read_record(value: &Value) -> Result<Record, String> {
     let f = fields(
         value,
         &[
             "type",
             "seq",
+            "tick",
             "intent_id",
             "agent",
             "verdict",
             "action",
             "reason",
             "policies",
+            "bundles",
             "intent",
             "prev",
             "digest",
         ],
         "the record",
     )?;
-    let Value::Array(items) = f[7] else {
-        return Err(format!("policies is {}, not an array", f[7].kind()));
+    let Value::Array(items) = f[8] else {
+        return Err(format!("policies is {}, not an array", f[8].kind()));
     };
     let policies = items
         .iter()
@@ -591,26 +655,44 @@ fn read_record(value: &Value) -> Result<Record, String> {
             _ => Err(format!("policies[{n}] is not a [name, label] pair")),
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let Value::Array(items) = f[9] else {
+        return Err(format!("bundles is {}, not an array", f[9].kind()));
+    };
+    let bundles = items
+        .iter()
+        .enumerate()
+        .map(|(n, item)| {
+            let what = format!("bundles[{n}]");
+            let b = fields(item, &["name", "revision", "digest"], &what)?;
+            Ok(BundleId {
+                name: string(b[0], &format!("{what}.name"))?.to_string(),
+                revision: string(b[1], &format!("{what}.revision"))?.to_string(),
+                digest: Digest(hex(b[2], &format!("{what}.digest"))?),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(Record {
         seq: number(f[1], "seq")?,
-        intent_id: decimal(f[2], "intent_id")?,
-        agent: string(f[3], "agent")?.to_string(),
-        verdict: string(f[4], "verdict")?.to_string(),
+        tick: decimal(f[2], "tick")?,
+        intent_id: decimal(f[3], "intent_id")?,
+        agent: string(f[4], "agent")?.to_string(),
+        verdict: string(f[5], "verdict")?.to_string(),
         evidence: Evidence {
-            action: string(f[5], "action")?.to_string(),
-            reason: opt_string(f[6], "reason")?,
+            action: string(f[6], "action")?.to_string(),
+            reason: opt_string(f[7], "reason")?,
             policies,
+            bundles,
         },
-        intent: match f[8] {
+        intent: match f[10] {
             Value::Null => None,
             other => Some(read_intent(other)?),
         },
-        prev: Digest(hex(f[9], "prev")?),
-        digest: Digest(hex(f[10], "digest")?),
+        prev: Digest(hex(f[11], "prev")?),
+        digest: Digest(hex(f[12], "digest")?),
     })
 }
 
-fn read_checkpoint(value: &Value) -> Result<Checkpoint, String> {
+pub(crate) fn read_checkpoint(value: &Value) -> Result<Checkpoint, String> {
     let f = fields(
         value,
         &["type", "size", "head", "root", "frontier", "signature"],
@@ -675,7 +757,8 @@ mod tests {
         )
         .signed(&key);
         let mut l = Ledger::new();
-        l.append_intent(
+        l.advance_clock(u64::MAX);
+        l.append_intent_with(
             &intent,
             "defer",
             Some("line one\nline two".into()),
@@ -683,6 +766,11 @@ mod tests {
                 ("allow".into(), "admit".into()),
                 ("conflict-window".into(), "defer".into()),
             ],
+            vec![BundleId {
+                name: "production".into(),
+                revision: "2026.10.28-1".into(),
+                digest: Digest([0xab; 32]),
+            }],
         );
         l.append(3, "ops", "released");
         let text = export(&l);
@@ -691,21 +779,27 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "{{\"type\":\"record\",\"seq\":0,\"intent_id\":\"18446744073709551615\",\
+                "{{\"type\":\"record\",\"seq\":0,\"tick\":\"18446744073709551615\",\
+                 \"intent_id\":\"18446744073709551615\",\
                  \"agent\":\"depl\\\"oyer\",\"verdict\":\"defer\",\"action\":\"apply web\",\
                  \"reason\":\"line one\\nline two\",\
                  \"policies\":[[\"allow\",\"admit\"],[\"conflict-window\",\"defer\"]],\
+                 \"bundles\":[{{\"name\":\"production\",\"revision\":\"2026.10.28-1\",\
+                 \"digest\":\"{}\"}}],\
                  \"intent\":{{\"id\":\"18446744073709551615\",\"agent\":\"depl\\\"oyer\",\
                  \"action\":{{\"kind\":\"apply\",\"resource\":\"web\",\"manifest\":\"v2\"}},\
                  \"priority\":\"urgent\",\"blast_radius\":\"service\",\"signature\":\"{}\"}},\
                  \"prev\":\"{}\",\"digest\":\"{}\"}}",
+                "ab".repeat(32),
                 intent.signature.unwrap(),
                 Digest::GENESIS,
                 r.digest
             )
         );
-        // Absent values are null, an empty policy list is [].
-        assert!(lines[2].contains("\"reason\":null,\"policies\":[],\"intent\":null,"));
+        // Absent values are null, empty policy and bundle lists are [].
+        assert!(
+            lines[2].contains("\"reason\":null,\"policies\":[],\"bundles\":[],\"intent\":null,")
+        );
         assert!(text.ends_with('\n'));
         assert!(!text.contains('\r'));
     }
@@ -953,11 +1047,20 @@ mod tests {
                 blasts[n],
             );
             let intent = if n == 1 { intent } else { intent.signed(&key) };
-            l.append_intent(
+            // Record n carries n bundles, with awkward text.
+            let bundles = (0..n)
+                .map(|i| BundleId {
+                    name: ["prod", "\u{e9}\"x\\y"][i].into(),
+                    revision: ["r1", "2026.10.28-1\n"][i].into(),
+                    digest: Digest([(n + i) as u8; 32]),
+                })
+                .collect();
+            l.append_intent_with(
                 &intent,
                 "admit",
                 [None, Some(String::new()), Some("why\n".into())][n].clone(),
                 vec![("p".into(), "admit".into()); n],
+                bundles,
             );
         }
         l.append(3, "ops", "released");
@@ -1037,9 +1140,20 @@ mod tests {
             "intent_id is not a u64",
         );
         refused(
-            &r("\"seq\":", "\"seq\":\"").replacen(",\"intent_id\"", "\",\"intent_id\"", 1),
+            &r("\"seq\":", "\"seq\":\"").replacen(",\"tick\"", "\",\"tick\"", 1),
             "seq is a string, not a number",
         );
+        // A tick is a u64 written as a decimal string, like an intent id.
+        refused(
+            &r("\"tick\":\"0\"", "\"tick\":0"),
+            "tick is a number, not a string",
+        );
+        refused(&r("\"tick\":\"0\"", "\"tick\":\"-1\""), "tick is not a u64");
+        refused(
+            &r("\"tick\":\"0\"", "\"tick\":\"18446744073709551616\""),
+            "tick is not a u64",
+        );
+        refused(&r(",\"tick\":\"0\"", ""), "the record has no \"tick\"");
         refused(
             &r("\"kind\":\"scale\"", "\"kind\":[\"scale\"]"),
             "intent.action.kind is not",
@@ -1078,11 +1192,53 @@ mod tests {
         );
         refused(
             &r("\"policies\":[", "\"policies\":{\"a\":[").replacen(
-                "]],\"intent\"",
-                "]]},\"intent\"",
+                "]],\"bundles\"",
+                "]]},\"bundles\"",
                 1,
             ),
             "policies is an object",
+        );
+        // Bundles: an array of {name, revision, digest}, exactly.
+        let digest = Digest([1; 32]).to_string();
+        let bundle = format!("{{\"name\":\"prod\",\"revision\":\"r1\",\"digest\":\"{digest}\"}}");
+        refused(
+            &r(&format!("\"bundles\":[{bundle}]"), "\"bundles\":{}"),
+            "bundles is an object, not an array",
+        );
+        refused(
+            &r(&bundle, "[\"prod\",\"r1\"]"),
+            "bundles[0] is an array, not an object",
+        );
+        refused(
+            &r("\"revision\":\"r1\",", ""),
+            "bundles[0] has no \"revision\"",
+        );
+        refused(
+            &r("\"revision\":\"r1\",", "\"revision\":\"r1\",\"by\":\"ci\","),
+            "bundles[0] has an unknown field \"by\"",
+        );
+        refused(
+            &r(
+                "\"name\":\"prod\",\"revision\":\"r1\"",
+                "\"revision\":\"r1\",\"name\":\"prod\"",
+            ),
+            "bundles[0] does not have its fields in the documented order",
+        );
+        refused(
+            &r("\"name\":\"prod\"", "\"name\":7"),
+            "bundles[0].name is a number",
+        );
+        refused(
+            &r("\"revision\":\"r1\"", "\"revision\":null"),
+            "bundles[0].revision is null",
+        );
+        refused(
+            &r(&digest, &"AB".repeat(32)),
+            "bundles[0].digest is not 32 bytes of lowercase hex",
+        );
+        refused(
+            &r(&digest, &"01".repeat(31)),
+            "bundles[0].digest is not 32 bytes of lowercase hex",
         );
         refused(
             &r("\"reason\":\"\"", "\"reason\":false"),

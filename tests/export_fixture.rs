@@ -1,9 +1,11 @@
 //! Writes an export full of edge cases to `target/export-fixture/`, for
 //! the independent verifier (`tools/verify-ledger.mjs`) to check in CI:
-//! the largest intent id, non-ASCII names, quotes, backslashes, newlines and
+//! the largest intent id, ticks beyond 2^53 and repeated ticks, non-ASCII
+//! names, quotes, backslashes, newlines and
 //! control characters in text, empty and missing fields, signed intents and
-//! signed checkpoints, including one at size 0, and an agent whose records
-//! were signed by a key it has since rotated away from. The same ledger is
+//! signed checkpoints, including one at size 0, an agent whose records
+//! were signed by a key it has since rotated away from, and records naming
+//! none, one or two policy bundles, in awkward text too. The same ledger is
 //! also kept on disk (`durable.jsonl`), which must be the export byte for
 //! byte, and the export must read back into the same ledger.
 
@@ -12,7 +14,33 @@ use std::path::Path;
 
 use floodwall::export::keys_json;
 use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
-use floodwall::{Keyring, Ledger, SigningKey};
+use floodwall::sha256::sha256;
+use floodwall::{BundleId, Digest, Keyring, Ledger, SigningKey};
+
+/// The bundles record `i` names: none, one, or two.
+fn bundles(i: u64) -> Vec<BundleId> {
+    let production = BundleId {
+        name: "production".into(),
+        revision: "2026.10.28-1".into(),
+        digest: Digest(sha256(b"format 1\n")),
+    };
+    let awkward = BundleId {
+        name: "\u{e9}quipe \"a\\b\"".into(),
+        revision: "line 1\nline 2\t\u{1}".into(),
+        digest: Digest([0xff; 32]),
+    };
+    match i % 3 {
+        0 => vec![],
+        1 => vec![production],
+        _ => vec![
+            production,
+            BundleId {
+                revision: String::new(),
+                ..awkward
+            },
+        ],
+    }
+}
 
 const AGENTS: [&str; 3] = ["déployeur", "a\"b\\c", "bot"];
 
@@ -45,6 +73,8 @@ fn fill(ledger: &mut Ledger) {
         Some("control \u{1} \u{1f} and \u{7f}, unicode 🦀, backslash \\ quote \"".into()),
     ];
     for i in 0..8u64 {
+        // Ticks 0, 0, 2, 2, then past 2^53 (exact only as a string).
+        ledger.advance_clock(if i < 4 { i / 2 * 2 } else { (1 << 60) + i });
         let who = (i % 3) as usize;
         let intent = Intent::new(
             if i == 0 { u64::MAX } else { i },
@@ -59,11 +89,12 @@ fn fill(ledger: &mut Ledger) {
         } else {
             vec![("règle".to_string(), "defer".to_string())]
         };
-        ledger.append_intent(
+        ledger.append_intent_with(
             &intent,
             ["admit", "defer", "reject"][who],
             reasons[who].clone(),
             policies,
+            bundles(i),
         );
     }
     ledger.checkpoint(); // size 8
@@ -110,6 +141,11 @@ fn write_an_edge_case_export_for_the_independent_verifier() {
 
     let text = String::from_utf8(whole.clone()).unwrap();
     assert!(text.contains("\"intent_id\":\"18446744073709551615\""));
+    // No bundles, one, and two with awkward text, escaped as JSON.
+    assert!(text.contains("\"bundles\":[],"));
+    assert!(text.contains("\"bundles\":[{\"name\":\"production\",\"revision\":\"2026.10.28-1\""));
+    assert!(text
+        .contains("{\"name\":\"\u{e9}quipe \\\"a\\\\b\\\"\",\"revision\":\"\",\"digest\":\"ffff"));
     assert_eq!(text.lines().count(), 1 + 8 + 4); // header, records, checkpoints 0/3/6/8
     assert!(keys_json(&keyring, None).contains(&format!(
         "\"retired\":{{\"bot\":[\"{}\"]}}",

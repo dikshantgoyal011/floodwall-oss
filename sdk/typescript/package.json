@@ -1,0 +1,41 @@
+{
+  "name": "@floodwall/client",
+  "version": "0.1.0",
+  "description": "Ask a Floodwall Cloud plane before your agent changes production.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erphq/floodwall.git",
+    "directory": "sdk/typescript"
+  },
+  "keywords": [
+    "floodwall",
+    "agents",
+    "devops",
+    "policy",
+    "change-management"
+  ],
+  "homepage": "https://floodwall.ai",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -6,8 +6,186 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for clients that reuse or reorder ids:** on a plane with a
+  keyring, `Rejected::Duplicate` now also means "this id is not above the
+  highest id already queued for the agent", and such an intent will never
+  run. Before, it only meant the same key was still live, and clients
+  could treat it as already queued. Agents must give each signed intent a
+  higher id than the last, including when retrying one the plane rejected
+  or expired. Ids refused at the door (rate limit, backpressure) may be
+  sent again.
+
+### Security
+
+- One agent's deferrals can no longer evict other agents' held intents. A
+  full hold queue used to evict its globally oldest intent, whatever its
+  agent, so an agent that kept deferring its own intents (naming resources
+  off the allowlist, say) could fill the hold and then expire, with each
+  new deferral, an intent another agent had waiting for human approval. The
+  per-agent rate limit bounds how fast an agent pushes, not how much of the
+  hold it occupies. A full hold now evicts the oldest intent of the agent
+  holding the most, with ties going to the tied agent whose oldest intent
+  is oldest. An agent can only push out another's intent while it holds no
+  more than that agent does. The choice depends only on what is held, so
+  `Floodwall::resume` replays it the same way.
+- A signed intent can no longer be submitted twice. With a keyring, ids
+  are now monotonic per agent, as `Intent::id` always documented: once an
+  intent is queued, `Floodwall::submit` refuses any later signed intent
+  from the same agent whose id is not above it, with `Rejected::Duplicate`.
+  Before, the same signed bytes (copied from a ledger or an export, say)
+  could be submitted again once the original was completed, rejected,
+  lapsed or expired, and ran again in the agent's name. A refusal at the
+  door (rate limit, backpressure) does not use up the id. `resume` rebuilds
+  each agent's highest id from the ledger, and changing the keyring keeps
+  it. The marks live with a plane and its ledger: a plane started on a new
+  ledger does not know the old one's ids, so give agents new keys when you
+  start one.
+- `Floodwall::resume` no longer lets a retired key vouch for a decision it
+  finishes. When a tick was cut short by a crash and the agent's key was
+  rotated before the restart, the decisions the restart wrote past the end
+  of the stored ledger trusted the signature check done against the
+  history's keys, retired ones included, and could admit an intent signed
+  only with the retired key. They are now checked against the current
+  keyring, like any decision made after a restart.
+- `tools/verify-ledger.mjs` given a plane key now requires every record to
+  be covered by a checkpoint the plane signed. Before, it checked the
+  signatures of the checkpoints present only, so whoever held an export
+  could remove its checkpoints, rewrite verdicts and re-hash the records,
+  and the verifier still printed "every checkpoint signature verified".
+  To check a ledger still being written, pass `--allow-uncovered-tail`:
+  the summary then says how many records no signed checkpoint covers.
+  Without a plane key, nothing changes.
+
+
 ### Added
 
+- Plane snapshots (FW-709). `Floodwall::snapshot` captures, at a
+  checkpoint that covers every record, everything a replay would rebuild
+  that is not configuration: the queue in order (each intent's place and
+  the tick it joined), every agent's rate-limit bucket, what is in flight
+  and since when, each resource's conflict claims, what is held and why,
+  which held intents were released and by whom, the per-agent id marks,
+  the clock, the checkpoint itself and the label of the settings in force
+  (`Floodwall::with_settings_label`, or the latest `reconfigure`).
+  `Snapshot::to_json` / `Snapshot::from_json` give it a stable one-line
+  text form with a version and a SHA-256 digest; anything not written
+  exactly so is refused. `Floodwall::resume_from_snapshot` takes the state
+  up on a newly built plane, asks for the settings it names, and replays
+  only the ledger after the checkpoint, checked digest for digest like
+  `resume_with` (which now shares the same replay code), refusing a ledger
+  that does not start at the snapshot's checkpoint
+  (`ResumeError::Snapshot`). `Snapshot::read_tail` reads those lines.
+- `Ledger::starting_at` makes a ledger that starts at a checkpoint
+  instead of genesis: it holds only the records after it, appends,
+  cuts (signed) checkpoints and proves inclusion from the checkpoint's
+  Merkle frontier as the whole ledger would, verifies from the
+  checkpoint's head, and exports as a suffix export. `Ledger::size`
+  counts every record, before the checkpoint too; `Ledger::len` and
+  `Ledger::records` are about the records it holds. `Floodwall::resume`
+  refuses such a ledger with `ResumeError::NotFromGenesis`.
+- Host: `open` takes an optional `snapshot`, with `ledger` then holding
+  only the lines after it, and a `snapshot` op returns the plane's
+  snapshot at its most recent checkpoint, cutting one at the end of the
+  ledger first if records came after it (`null` before the first
+  checkpoint). `state` and `verify` count every record, before a snapshot
+  too.
+- Optional aging for low-priority work (FW-908).
+  `SchedulerConfig::with_aging(Some(Aging::new(every, up_to)))` walks a
+  waiting intent one priority higher for every `every` ticks it has waited
+  in the queue (0 is refused), up to `up_to`, so a steady stream of
+  higher-priority work can no longer keep `Bulk` work waiting forever.
+  Within a priority, intents are walked in the order they joined the
+  queue, so an aged intent goes ahead of newer ones, and once blocked
+  keeps what it waits for from them. Only the order of the pass changes:
+  the gate sees, and the ledger records, the priority the intent was
+  submitted with. An intent at or above `up_to` does not age, and one
+  released from hold ages from its release. `Aging::priority` gives the
+  priority an intent is walked at after waiting so long, and
+  `Floodwall::queued` lists the queue in the order a pass at the plane's
+  clock walks it. `Floodwall::resume` replays the same order, so a plane
+  resumes only with the same aging. No aging, the default, changes
+  nothing.
+- In-flight leases (FW-906). `SchedulerConfig::with_lease(Some(lease))`
+  puts every intent in flight on a lease of so many ticks (`Lease::ticks`;
+  0 is refused). An intent in flight that long is overdue, and every
+  `Floodwall::tick` deals with it before its pass: under `Lease::Report`,
+  it is listed in `TickReport::overdue` until the caller completes it;
+  under `Lease::Fail`, it lapses: it is recorded with the new verdict
+  `LAPSED` (`"lapsed"`), its place is freed for that same pass, its claim
+  stays open for the conflict window, it is listed in `TickReport::lapsed`,
+  and `complete` on it is `NotInFlight`. `Floodwall::resume` replays
+  lapses as part of their tick, so a plane resumes only with the same
+  lease. The stats count lapses (`Counts::lapsed`) and show what is
+  overdue (`Stats::overdue`, `floodwall_overdue`). No lease, the default,
+  changes nothing. `TickReport` gains the `overdue` and `lapsed` fields.
+- Observability (FW-904). `Floodwall::stats` returns a `Stats`: for each
+  agent (`Stats::agent`, `Stats::agents`) and in all (`Stats::total`), a
+  `Counts` of the intents refused at the door, by reason (unsigned,
+  unknown agent, bad signature, duplicate, backpressure, rate limited),
+  queued, admitted, deferred, rejected, released, expired (by a human, past
+  the TTL, or evicted), succeeded and failed; and the queue's depth and its
+  peak, what is in flight and what is held. `Stats::prometheus` writes it
+  in the Prometheus text exposition format, with no dependency. The counts
+  are what the plane did since it was built or resumed: `Floodwall::resume`
+  starts them afresh. Per-agent counts are kept for the first
+  `stats::AGENT_LIMIT` (1024) agents; later ones are counted together in
+  `Stats::untracked`, and so, with a keyring, is what is refused at the
+  door in the name of an agent outside it. `tests/stats_property.rs`
+  checks the stats are exactly what every call returned, through random
+  floods and restarts, and the demo checks them against its own tally.
+- Versioned policy bundles, recorded with every decision (FW-503). A rules
+  file can declare `bundle "<name>" revision "<revision>"` right after its
+  format line; its identity is `BundleId`: the name, the revision, and the
+  SHA-256 of the file, so an auditor holding it can match it with
+  `sha256sum`. `Gate::with_rules` remembers the bundle (`Gate::bundles`;
+  a gate holds a bundle of a given name once), and every decision a
+  `Floodwall` makes records its gate's bundles in `Evidence::bundles`;
+  arrivals, releases, expiries and outcomes record none.
+  `rules::bundle(text)` reads a file's bundle, and
+  `Ledger::append_intent_with` writes an intent's record with bundles.
+  `tools/verify-ledger.mjs` checks them and lists each bundle a ledger
+  names, with on how many records. `Floodwall::resume` keeps the bundles
+  the ledger shows on replayed decisions when the gate has bundles of the
+  same names, so a plane can restart on a new revision that rules on its
+  history the same way; other bundles are `ResumeError::Diverged`.
+  `policies/production.rules` is released as bundle `production`, and
+  `.gitattributes` keeps `policies/` LF so a checkout hashes as released.
+  - **Breaking:** record encoding `floodwall/ledger/record/v4`: a record's
+    digest covers its bundles (their number, then each one's name, revision
+    and digest), so every digest, and the demo's head, changes. The export
+    writes `"bundles"` after `"policies"` on every record line, `[]`
+    when there are none, and names v4 in its header. `Evidence` gains the
+    `bundles` field.
+- A worked example of OPA/Rego-style policies at the gate (FW-502).
+  `policies/production.rules` writes a platform team's production
+  guardrails as rules: images only from the internal registry, no agent
+  taking a database or queue to zero, service ownership, scale bounds that
+  wait for a human, more urgency for wider changes, and chaos agents kept in
+  staging. `policies/README.md` sets each one next to the Rego it stands
+  for and says what carries over and what does not, and
+  `cargo run --example production` runs them at the gate.
+  `tests/production_policies.rs` transcribes the Rego into Rust and checks
+  the rules decide exactly as it does, with the same messages, on 24,576
+  intents either side of every boundary, and that the walkthrough's output
+  and quoted policies are the example's and the file's.
+- Policies as data (FW-501). `floodwall::rules` reads a small declarative
+  rules language: named policies, each a list of `reject "reason" when
+  <condition>` and `defer "reason" when <condition>` rules, with
+  conditions over an intent's agent, resource, manifest, kind, replicas,
+  priority and blast radius (comparisons, `in`/`not in` lists, `*`
+  patterns, `destructive`, `not`/`and`/`or`, parentheses) and reasons
+  that name its fields (`{resource}`, `{agent}`, ...). A policy's verdict
+  is the harshest of its rules that hold, with the first one's reason.
+  Files are checked when read: unknown fields, values of the wrong type,
+  orderings of unordered fields, duplicate or reserved policy names and
+  other mistakes are a `ParseError` with the line and column. `rules::parse`
+  returns `RulePolicy`s, which are `Policy`s like any other, and
+  `Gate::with_rules` adds a whole file to a gate. Zero dependencies.
+  `policies/standard.rules` writes the built-in policies as rules, and a
+  test checks it rules exactly as they do on every combination of action,
+  priority and blast radius.
 - `ledger::Evidence`: each `Record` now carries the action summary, the
   verdict's reason, and every policy's verdict, all covered by the
   digest. `Ledger::append_with` records it; `Floodwall::tick` fills it in.
@@ -66,6 +244,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A property test that replaying the record stream reproduces the live
+  decisions (FW-403): `tests/replay_property.rs` floods 150 randomly
+  configured planes (and 6 signed ones), checks every tick's report is
+  exactly what it recorded, replays each whole ledger on a new plane,
+  restarts the same flood at random points (from an export, from a file,
+  and after a crash that cut a tick short) and requires every call's
+  result, the final state and the final ledger to match the flood run
+  straight through, and changes one decision in each ledger (re-hashing
+  the chain) to require the replay to refuse it at exactly that record.
+  It found that a restart lost clock moves no record shows, which
+  `Floodwall::resume`'s `now` fixes.
+- A plane picks up where it left off after a restart (FW-402, FW-405).
+  `Floodwall::resume(ledger, now)` replays a plane's ledger on a newly built
+  plane with the same configuration: it makes the same calls at the same
+  ticks and checks each one writes exactly the record the ledger holds,
+  so the queue and its order, every agent's rate-limit bucket, what is in
+  flight and since when, every conflict claim, what is held and why, and
+  pending releases all come back as they were. A plane built differently,
+  or a ledger holding a decision the plane would not have made, is refused
+  with `ResumeError::Diverged` at the first record that comes out
+  differently (saying what differs); records no plane writes are
+  `ResumeError::Unreplayable`. A tick a crash cut short is finished.
+  With a keyring, every intent in the ledger must be signed by its agent
+  (current or retired key), or resuming fails with
+  `ResumeError::Unauthenticated`: a ledger's hashes alone prove nothing
+  about who asked. Pending intents are checked again against the current
+  keyring when next ruled on, so a retired key never authorizes new work.
+  `now` is the tick the plane restarts at (the latest tick it
+  was given, or later): a call that recorded nothing still moved the
+  clock, which the ledger cannot show.
+  - **Breaking:** every intent that gets into the queue is now recorded,
+    as `queued` (`QUEUED`), and synced before `submit` returns, so an
+    accepted intent is not lost if the plane stops before ruling on it.
+    Ledgers have one more record per accepted intent.
+  - A rate-limited attempt no longer changes the agent's bucket: the
+    refill is only kept with the token it pays for, so a bucket depends
+    only on the intents that got in (which the ledger records), and is the
+    same floating-point sum however many attempts came between.
+  - `Floodwall::with_ledger` points to `resume` for a ledger with records.
+  - The demo's `--ledger FILE` restarts the plane from its file halfway
+    through the flood; CI checks the ledger is the same bytes as a run
+    without the restart.
+- **Breaking:** every ledger record carries the logical tick it was
+  written at (FW-404): `Record::tick`, covered by the digest under record
+  encoding `floodwall/ledger/record/v3` (the tick follows `seq`). The
+  ledger keeps a clock that only moves forward (`Ledger::clock`,
+  `Ledger::advance_clock`); a `Floodwall` keeps it at the plane's own
+  clock, so every decision, release, expiry and outcome shows when it
+  happened. `Floodwall::with_ledger` brings whichever of the two clocks is
+  behind up to the other, so they never disagree. `Ledger::verify`,
+  `Ledger::open` and `Ledger::read_jsonl` refuse a record whose tick is
+  earlier than the one before it. The JSON Lines export writes `"tick"`
+  as a decimal string after `"seq"` (a tick can exceed 2^53) and names
+  record encoding v3 in its header;
+  `tools/verify-ledger.mjs` checks both, and the edge-case fixture has
+  ticks past 2^53. The reference digests are pinned again from an
+  independent implementation of v3.
 - Durable, append-only ledger on disk (FW-401). `Ledger::create(path)`
   starts a ledger in a new file and `Ledger::open(path)` picks it up again
   after a restart or crash; the file is the ledger's JSON Lines export,

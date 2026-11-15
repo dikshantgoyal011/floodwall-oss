@@ -32,14 +32,18 @@ You cannot review your way out of that. You have to **govern throughput**: admit
 
 | Stage | Crate module | What it does |
 |-------|--------------|--------------|
-| **Identity** | [`keyring`](src/keyring.rs) / [`ed25519`](src/ed25519.rs) | Optional: with a keyring of agents' public keys, every intent must carry its agent's Ed25519 signature. Unsigned, unknown and forged intents are refused before they reach the queue or spend an agent's rate limit. |
+| **Identity** | [`keyring`](src/keyring.rs) / [`ed25519`](src/ed25519.rs) | Optional: with a keyring of agents' public keys, every intent must carry its agent's Ed25519 signature. Unsigned, unknown and forged intents are refused before they reach the queue or spend an agent's rate limit, and ids are monotonic per agent, so signed bytes cannot be replayed on the same plane. |
 | **Admission** | [`admission`](src/admission.rs) | A per-agent token bucket caps how fast any one agent can push, so a single runaway loop cannot starve the fleet. A bounded priority queue orders what is waiting (highest priority first, FIFO within a priority) and applies backpressure once it is full. |
-| **Scheduler** | [`scheduler`](src/scheduler.rs) | Decides when each waiting intent may start. A `Global` change runs alone; `Region` changes run one at a time with their resource to themselves; narrow changes run in parallel across resources, up to a per-resource in-flight limit. A blocked intent keeps what it waits for from lower-priority work, so wide changes are never starved. Two agents' contradictory changes to one resource within a conflict window are deferred. |
+| **Scheduler** | [`scheduler`](src/scheduler.rs) | Decides when each waiting intent may start. A `Global` change runs alone; `Region` changes run one at a time with their resource to themselves; narrow changes run in parallel across resources, up to a per-resource in-flight limit. A blocked intent keeps what it waits for from lower-priority work, so a wide change is not starved by the smaller ones behind it; optional aging raises what has waited long, so low-priority work is not starved by higher-priority work either. Two agents' contradictory changes to one resource within a conflict window are deferred. |
 | **Gate** | [`gate`](src/gate.rs) / [`policy`](src/policy.rs) | A stack of policies, each a pure function from an intent to a verdict, composed with **deny-overrides**: the harshest verdict wins, so one `Reject` blocks a change no matter how many policies admit it. |
-| **Hold** | [`hold`](src/hold.rs) | A `Defer` is "not yet", not "no". Deferred intents wait here until a human releases them (their deferrals are then waived; rejections still apply) or expires them, or until a TTL runs out. |
-| **Ledger** | [`ledger`](src/ledger.rs) | Every decision, release, expiry and outcome is appended to a SHA-256 hash chain together with its evidence: the action, the reason, and each policy's verdict. Each record folds in the previous digest, so any retroactive edit to history breaks the chain. Every so many records the ledger cuts a [checkpoint](src/checkpoint.rs) (chain head + Merkle root), optionally signed by the plane, so an auditor can check the rest of the ledger from a checkpoint without replaying it from genesis. |
+| **Hold** | [`hold`](src/hold.rs) | A `Defer` is "not yet", not "no". Deferred intents wait here until a human releases them (their deferrals are then waived; rejections still apply) or expires them, or until a TTL runs out. A full hold evicts from the agent holding the most, so one agent's deferrals cannot push out another's. |
+| **Ledger** | [`ledger`](src/ledger.rs) | Every decision, release, expiry and outcome is appended to a SHA-256 hash chain together with its evidence: the action, the reason, each policy's verdict, and, for a decision, the versioned policy bundles its rules came from. Each record folds in the previous digest, so any retroactive edit to history breaks the chain. Every so many records the ledger cuts a [checkpoint](src/checkpoint.rs) (chain head + Merkle root), optionally signed by the plane, so an auditor can check the rest of the ledger from a checkpoint without replaying it from genesis. |
 
 The unit that flows through all of it is an [`Intent`](src/intent.rs): a change an agent *wants* to make, fully attributed, tagged with how urgent it is (`Priority`) and how much it can break (`BlastRadius`). Agents never touch production directly. They submit intents. The floodwall decides what runs, when, and alongside what; the caller applies each admitted change and reports back.
+
+## Floodwall Cloud
+
+To use a hosted plane instead of embedding the crate, follow the [Quickstart](QUICKSTART.md): make a plane and a key in the console, then wrap each change your agent makes in `guard()` from the [TypeScript](sdk/typescript) or [Python](sdk/python) client.
 
 ## Use
 
@@ -116,6 +120,67 @@ assert_eq!(report.decisions[0].verdict, Verdict::Admit);
 assert_eq!(report.decisions[0].released_by.as_deref(), Some("alice"));
 ```
 
+An admitted intent holds its place until you report back. If a caller may never (it crashed, or lost track of what it was given), put what is in flight on a lease:
+
+```rust
+use floodwall::{Admission, Floodwall, Gate, Lease, NotInFlight, Outcome, RateLimit, SchedulerConfig, LAPSED};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+
+// A change not reported back within 30 ticks has failed, and frees its resource.
+let mut plane = Floodwall::new(Admission::new(64, RateLimit::new(8.0, 1.0)), Gate::new())
+    .with_scheduler(SchedulerConfig::default().with_lease(Some(Lease::Fail(30))));
+let intent = Intent::new(
+    1,
+    AgentId::new("deployer"),
+    Action::Apply { resource: "web".into(), manifest: "v2".into() },
+    Priority::Normal,
+    BlastRadius::Service,
+);
+let key = intent.key();
+plane.submit(intent, 0).unwrap();
+plane.tick(0); // dispatched, and then the deployer goes quiet
+
+let report = plane.tick(30);
+assert_eq!(report.lapsed[0].intent.key(), key);
+assert_eq!(plane.ledger().records().last().unwrap().verdict, LAPSED);
+assert_eq!(plane.complete(&key, Outcome::Succeeded, 31), Err(NotInFlight(key)));
+```
+
+`Lease::Report(30)` instead lists it in every tick's `overdue` until you report back, and leaves it in flight. A lapse frees the resource whether or not the caller is still applying the change, so `Fail` suits callers whose own timeout is shorter than the lease.
+
+Priority is strict, so a steady stream of higher-priority work can keep a `Bulk` change waiting forever. Aging bounds the wait: a waiting change rises one priority for every so many ticks it has waited, up to a ceiling, and is ruled on sooner. Only the order changes: the gate still sees, and the ledger records, the priority the change was submitted with.
+
+```rust
+use floodwall::{Admission, Aging, Floodwall, Gate, Outcome, RateLimit, SchedulerConfig};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+
+// One priority higher for every 20 ticks in the queue, up to Normal.
+let aging = Aging::new(20, Priority::Normal);
+let mut plane = Floodwall::new(Admission::new(64, RateLimit::new(8.0, 1.0)), Gate::new())
+    .with_scheduler(SchedulerConfig::default().with_aging(Some(aging)));
+let scale = |agent: &str, id, priority| Intent::new(
+    id,
+    AgentId::new(agent),
+    Action::Scale { resource: "web".into(), replicas: 3 },
+    priority,
+    BlastRadius::Service,
+);
+plane.submit(scale("deployer", 1, Priority::Normal), 0).unwrap();
+plane.tick(0); // web is busy
+plane.submit(scale("cleanup-bot", 1, Priority::Bulk), 0).unwrap();
+plane.submit(scale("deployer", 2, Priority::Normal), 20).unwrap();
+let done = scale("deployer", 1, Priority::Normal).key();
+plane.complete(&done, Outcome::Succeeded, 20).unwrap();
+
+// Waiting since tick 0, the Bulk change is walked as Normal, and it was
+// there before deployer#2.
+let report = plane.tick(20);
+assert_eq!(report.decisions[0].intent.key().to_string(), "cleanup-bot#1");
+assert_eq!(report.decisions[0].intent.priority, Priority::Bulk);
+```
+
+A change at or above the ceiling does not age, so a ceiling below `Pager` keeps incident work ahead of anything that has merely waited.
+
 With a keyring, every agent signs its intents, and the ledger proves who asked for what:
 
 ```rust
@@ -140,8 +205,9 @@ assert_eq!(plane.submit(intent.clone(), 0), Err(Rejected::Unsigned));
 plane.submit(intent.signed(&deployer), 0).unwrap();
 plane.tick(0);
 
-// An auditor with the public keys checks every record's authorship.
-assert_eq!(plane.ledger().verify_signatures(&keyring), Ok(1));
+// An auditor with the public keys checks every record's authorship: its
+// arrival in the queue, and the decision.
+assert_eq!(plane.ledger().verify_signatures(&keyring), Ok(2));
 ```
 
 Checkpoints let an auditor pick up from where they last checked, with only the new records:
@@ -151,7 +217,7 @@ Checkpoints let an auditor pick up from where they last checked, with only the n
 # use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
 let plane_key = SigningKey::from_seed(&[7; 32]);
 let mut plane = Floodwall::new(Admission::new(1024, RateLimit::new(8.0, 1.0)), Gate::new())
-    .with_ledger(Ledger::new().with_checkpoints(2).with_signer(plane_key.clone()));
+    .with_ledger(Ledger::new().with_checkpoints(4).with_signer(plane_key.clone()));
 for id in 0..5 {
     let intent = Intent::new(
         id,
@@ -162,48 +228,52 @@ for id in 0..5 {
     );
     plane.submit(intent, 0).unwrap();
 }
-plane.tick(0); // five decisions recorded: checkpoints at 2 and 4
-let latest = plane.checkpoint(); // and one now, at 5
+plane.tick(0); // five arrivals and five decisions: checkpoints at 4 and 8
+let latest = plane.checkpoint(); // and one now, at 10
 
-// The auditor already trusted the checkpoint at 2. They check the three
+// The auditor already trusted the checkpoint at 4. They check the six
 // records after it, and nothing before it.
 let trusted = plane.ledger().checkpoints()[0].clone();
 let suffix = plane.ledger().records_after(&trusted).unwrap();
-assert_eq!(suffix.len(), 3);
+assert_eq!(suffix.len(), 6);
 assert!(audit_suffix(&trusted, &latest, suffix, Some(&plane_key.verifying_key())).is_ok());
 ```
 
 ### Keeping the ledger on disk
 
-`Ledger::create(path)` starts a ledger in a new file and `Ledger::open(path)` picks it up after a restart or a crash. The file is the ledger's own JSON Lines export (below), written as it grows. Every decision is written and synced before the call that made it returns, a second writer is locked out, and a crash mid-write costs only the unfinished last line:
+`Ledger::create(path)` starts a ledger in a new file, and `Floodwall::resume` picks a plane up again from it after a restart or a crash. The file is the ledger's own JSON Lines export (below), written as it grows. Every intent that gets in and every decision is written and synced before the call that made it returns, a second writer is locked out, and a crash mid-write costs only the unfinished last line:
 
 ```rust
 # use floodwall::{Admission, Floodwall, Gate, Ledger, RateLimit};
 # use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
 let path = std::env::temp_dir().join(format!("floodwall-readme-{}.jsonl", std::process::id()));
 # let _ = std::fs::remove_file(&path);
-let mut plane = Floodwall::new(Admission::new(1024, RateLimit::new(8.0, 1.0)), Gate::new())
-    .with_ledger(Ledger::create(&path).unwrap());
-let intent = Intent::new(
-    1,
+// Build the plane the same way every time it starts.
+let plane = || Floodwall::new(Admission::new(1024, RateLimit::new(8.0, 1.0)), Gate::new());
+let scale = |id, resource: &str| Intent::new(
+    id,
     AgentId::new("deployer"),
-    Action::Scale { resource: "web".into(), replicas: 3 },
+    Action::Scale { resource: resource.into(), replicas: 3 },
     Priority::Normal,
     BlastRadius::Service,
 );
-plane.submit(intent, 0).unwrap();
-plane.tick(0); // the decision is on disk before tick returns
-let head = plane.ledger().head();
-drop(plane);
+let mut wall = plane().with_ledger(Ledger::create(&path).unwrap());
+wall.submit(scale(1, "web"), 0).unwrap();
+wall.tick(0); // in flight, and on disk before tick returns
+wall.submit(scale(2, "api"), 1).unwrap(); // queued, and on disk
+drop(wall); // the process stops
 
-// After a restart: the same ledger, read back and checked from genesis.
-let ledger = Ledger::open(&path).unwrap();
-assert_eq!((ledger.len(), ledger.head()), (1, head));
-# drop(ledger);
+// After the restart: the ledger is read back, checked from genesis, and
+// replayed, so the plane holds exactly what it held before. It restarts at
+// tick 1, the last tick it was given.
+let wall = plane().resume(Ledger::open(&path).unwrap(), 1).unwrap();
+assert_eq!(wall.in_flight().count(), 1);
+assert_eq!(wall.pending(), 1);
+# drop(wall);
 # std::fs::remove_file(&path).unwrap();
 ```
 
-A plane resuming its queue and in-flight work from a reopened ledger comes next (FW-402); for now a reopened ledger can be audited, exported and appended to.
+The replay makes the same calls, at the same ticks, and checks each one writes exactly the record the ledger holds, so the queue, every agent's rate limit, what is in flight, every conflict claim, and everything held come back as they were. A plane built differently, or a ledger with a decision the plane would not have made, is refused at the first record that comes out differently. The demo shows it with `cargo run --release -- --ledger audit/durable.jsonl`: it restarts the plane from the file halfway through the flood, and its ledger comes out the same, byte for byte, as a run without the restart.
 
 ### Auditing with your own tools
 
@@ -212,11 +282,12 @@ The ledger exports as [JSON Lines](src/export.rs): a header, then every record a
 ```text
 $ cargo run --release -- --export audit/      # the demo writes ledger.jsonl, ledger-suffix.jsonl and keys.json
 $ node tools/verify-ledger.mjs audit/ledger.jsonl audit/keys.json
-ok: 2043 records from genesis; 8 checkpoints; head 189f5d55…
-ok: 2043 agent signatures and every checkpoint signature verified
+ok: 2989 records from genesis; 12 checkpoints; head d68d4329…
+ok: 2989 agent signatures and every checkpoint signature verified
+ok: every record is covered by a checkpoint signed by the plane
 ```
 
-[`tools/verify-ledger.mjs`](tools/verify-ledger.mjs) is an independent implementation using only Node's standard library. It refuses anything not written exactly in the documented format, recomputes every record and intent digest, checks every link, Merkle root and frontier and that every record shows the intent it holds, and with the public keys (current and retired) checks every agent and checkpoint signature. A suffix export (`Ledger::export_jsonl_from(checkpoint)`) is checked from that checkpoint alone. A ledger file on disk is checked the same way: `cargo run --release -- --ledger audit/durable.jsonl` keeps the demo's ledger on disk, and the file is the same bytes as `ledger.jsonl`. CI runs it on every change.
+[`tools/verify-ledger.mjs`](tools/verify-ledger.mjs) is an independent implementation using only Node's standard library. It refuses anything not written exactly in the documented format, recomputes every record and intent digest, checks every link, Merkle root and frontier and that every record shows the intent it holds, and with the public keys (current and retired) checks every agent and checkpoint signature. With the plane's key it also requires every record to be covered by a checkpoint the plane signed, since only those vouch for the verdicts: an export whose checkpoints were removed is refused, and a ledger still being written can be checked with `--allow-uncovered-tail`, which reports how many records are not yet covered. Coverage is not completeness: an export cut short at an earlier signed checkpoint still verifies, so compare the head and size it prints with a checkpoint you got from the plane another way. A suffix export (`Ledger::export_jsonl_from(checkpoint)`) is checked from that checkpoint alone. A ledger file on disk is checked the same way: it is the same bytes as `ledger.jsonl`. CI runs it on every change.
 
 Writing your own policy is one trait method:
 
@@ -239,12 +310,114 @@ impl Policy for FreezeWindow {
 }
 ```
 
+Or write policies as data, in a small rules language, and load them at the gate without touching Rust:
+
+```rust
+use floodwall::{Admission, Floodwall, Gate, RateLimit, Verdict};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+
+let rules = r#"
+format 1
+
+policy "freeze-billing" {
+  reject "billing is frozen until the audit closes"
+    when resource matches "billing*" and kind != scale
+  defer "{agent} may only scale billing with a human's say-so"
+    when resource matches "billing*" and agent != "autoscaler"
+}
+"#;
+let gate = Gate::new().with_rules(rules).unwrap();
+let mut plane = Floodwall::new(Admission::new(64, RateLimit::new(8.0, 1.0)), gate);
+let intent = Intent::new(
+    1,
+    AgentId::new("deployer"),
+    Action::Apply { resource: "billing-eu".into(), manifest: "v2".into() },
+    Priority::Normal,
+    BlastRadius::Service,
+);
+plane.submit(intent, 0).unwrap();
+let report = plane.tick(0);
+assert_eq!(report.decisions[0].verdict, Verdict::Reject("billing is frozen until the audit closes".into()));
+```
+
+Rules test an intent's agent, resource, manifest, kind, replicas, priority and blast radius, with comparisons, lists, `*` patterns, `not`, `and` and `or`; a file that mistypes a field or a value is refused with its line and column. [`policies/standard.rules`](policies/standard.rules) writes the built-in policies this way, and the tests check it rules exactly as they do. The format is documented in [`src/rules.rs`](src/rules.rs).
+
+For a worked example, [`policies/README.md`](policies/README.md) writes a platform team's production guardrails (a trusted image registry, protected state, service ownership, scale bounds, change risk) as rules, each next to the OPA/Rego it stands for, and `cargo run --example production` runs them at the gate.
+
+A rules file can declare itself a versioned policy bundle. Every decision made with it then records, in the ledger, which revision of which rules decided:
+
+```rust
+use floodwall::{Admission, Floodwall, Gate, RateLimit};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+
+let rules = r#"
+format 1
+bundle "production" revision "2026.10.28-1"
+
+policy "protect-state" {
+  reject "{resource} holds state" when destructive and resource matches "*-db"
+}
+"#;
+let gate = Gate::new().with_rules(rules).unwrap();
+let bundle = gate.bundles()[0].clone(); // name, revision, and the file's SHA-256
+assert_eq!(bundle.to_string(), "production 2026.10.28-1");
+
+let mut plane = Floodwall::new(Admission::new(64, RateLimit::new(8.0, 1.0)), gate);
+let intent = Intent::new(
+    1,
+    AgentId::new("cleanup-bot"),
+    Action::Destroy { resource: "orders-db".into() },
+    Priority::Normal,
+    BlastRadius::Service,
+);
+plane.submit(intent, 0).unwrap();
+plane.tick(0);
+let decision = plane.ledger().records().last().unwrap();
+assert_eq!(decision.verdict, "reject");
+assert_eq!(decision.evidence.bundles, [bundle]); // covered by the record's digest
+```
+
+The bundle's digest is the SHA-256 of the file, so an auditor holding it can match it with `sha256sum`. The export carries the bundles, and `tools/verify-ledger.mjs` lists the bundles a ledger names. A plane can restart on a new revision that rules on its history the same way; the earlier decisions keep theirs.
+
+### Watching the plane
+
+The plane counts what it does as it goes: for each agent, and for the whole fleet, what was refused at the door and why, admitted, deferred, rejected, released, expired, and how it turned out (lapses included); and how deep the queue is, how much is in flight, how much of that is overdue, and how much is held. `Stats::prometheus` writes the same numbers in the Prometheus text format, with no dependency, for a `/metrics` endpoint:
+
+```rust
+use floodwall::{Admission, Floodwall, Gate, RateLimit};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+
+// Each agent may burst one intent, and never refills.
+let mut plane = Floodwall::new(Admission::new(64, RateLimit::new(1.0, 0.0)), Gate::new());
+let scale = |id| Intent::new(
+    id,
+    AgentId::new("autoscaler"),
+    Action::Scale { resource: "web".into(), replicas: 3 },
+    Priority::Normal,
+    BlastRadius::Service,
+);
+plane.submit(scale(1), 0).unwrap();
+plane.submit(scale(2), 0).unwrap_err(); // over its rate limit
+plane.tick(0);
+
+let stats = plane.stats();
+let autoscaler = stats.agent("autoscaler").unwrap();
+assert_eq!((autoscaler.queued, autoscaler.rate_limited, autoscaler.admitted), (1, 1, 1));
+assert_eq!(stats.in_flight, 1);
+
+let text = stats.prometheus();
+assert!(text.contains(r#"floodwall_intents_total{agent="autoscaler",event="rate_limited"} 1"#));
+assert!(text.contains("floodwall_in_flight 1"));
+```
+
+The counts start when the plane is built, or resumed from its ledger, as metrics do when a process restarts: the ledger keeps the history, but not the refusals at the door. Per-agent counts are kept for the first 1024 agents, and with a keyring only for the agents in it; the rest are counted together, so a fleet minting fresh ids cannot grow the plane's memory, and intents in made-up names cannot crowd out the real agents.
+
 ## Demo
 
 ```text
 $ cargo run --release
 
-floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 385
+floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 373
 
   at the wall (signatures + admission control)
     forged         : 102 refused (bad signature)
@@ -253,33 +426,33 @@ floodwall demo - 4000 intents flung at the wall over 200 ticks, settled by tick 
     queued         : 946
 
   scheduler (what may run now)
-    peak in flight : 7 across 4 resources
-    region changes : 26, one at a time
+    peak in flight : 8 across 4 resources
+    region changes : 25, one at a time
     global changes : 6, each alone
 
   through the gate (policies + conflict check)
-    admitted       : 359
-    deferred       : 547 (318 contradicted another agent)
+    admitted       : 348
+    deferred       : 553 (316 contradicted another agent)
     rejected       : 231
 
   hold queue (human in the loop)
-    released       : 191 (0 still rejected)
-    expired        : 194 by the operator, 162 by TTL or a full hold
+    released       : 186 (0 still rejected)
+    expired        : 204 by the operator, 163 by TTL or a full hold
 
   applied (reported back)
-    succeeded      : 330
-    failed         : 29
+    succeeded      : 323
+    failed         : 25
 
   ledger (tamper-evident)
-    records        : 2043
-    head digest    : 189f5d551888eeae1379978c5662e54d7bb4b25323bdf871bbbecd5c0f84c3ca
+    records        : 2979
+    head digest    : 3dfb8d835912e386ae1947b75464afcc6e0323d9d672f9ef5c34213fd4d27e0f
     chain valid    : true
-    signatures     : all 2043 records signed by their agents
+    signatures     : all 2979 records signed by their agents
 
   checkpoints (audit without replaying)
-    checkpoints    : 8, all signed by the plane
-    suffix audit   : records 1792..2043 checked from the checkpoint at 1792: ok
-    inclusion      : record 681 proven in the latest root with 11 hashes: true
+    checkpoints    : 12, all signed by the plane
+    suffix audit   : records 2816..2979 checked from the checkpoint at 2816: ok
+    inclusion      : record 993 proven in the latest root with 12 hashes: true
 ```
 
 Five agents (including a `chaos-monkey`) fling 4000 changes at the wall. Admission control turns most of the flood away. The scheduler runs what is left in parallel across resources while serializing region-wide and global changes, the gate and conflict check sort each change into admit / defer / reject, and an operator works the hold queue every 10 ticks. Every admitted change is applied and reported back, and the ledger comes out the other side with its chain intact. Every agent signs its intents; the chaos monkey now and then forges one in the deployer's name, which is refused at the door, and every record left in the ledger verifies against the agents' public keys. Finally, an auditor who trusts the second-to-last signed checkpoint checks the rest of the ledger from it alone, and one record is proven to be in the ledger with a handful of hashes.
@@ -291,8 +464,8 @@ Five agents (including a `chaos-monkey`) fling 4000 changes at the wall. Admissi
 | 0.1 | Intent model, per-agent token-bucket admission + bounded priority queue, deny-overrides policy gate, hash-chained ledger, end-to-end `Floodwall` | **shipped** |
 | 0.2 | Scheduler: wide-blast serialization, narrow work in parallel by resource, per-resource in-flight limits, conflict detection, hold queue with human release and expiry | **done** |
 | 0.3 | Cryptographic ledger: SHA-256 chain, Ed25519-signed records, signed Merkle checkpoints, JSON Lines export with an independent verifier | **done** |
-| 0.4 | Persistence + replay: a durable ledger on disk, then rebuilding plane state from it | in progress |
-| 0.5 | Policy-as-code: declarative rules + a worked OPA-style example          |        |
+| 0.4 | Persistence + replay: a durable ledger on disk, every record's tick, and a plane rebuilt exactly by replaying its ledger | **done** |
+| 0.5 | Policy-as-code: declarative rules, a worked OPA-style example, and versioned policy bundles recorded with every decision | **done** |
 
 See [GOALS.md](GOALS.md) for the full roadmap and [STATUS.md](STATUS.md) for current state.
 
@@ -302,9 +475,9 @@ See [GOALS.md](GOALS.md) for the full roadmap and [STATUS.md](STATUS.md) for cur
 - **Auditable without this crate.** The JSON Lines export plus the documented encodings are enough to verify everything; `tools/verify-ledger.mjs` proves it in CI, sharing no code with the Rust implementation.
 - **Signing is not side-channel audited.** Verification only handles public data. Signing avoids secret-dependent branches where it is easy to, but agents holding long-lived production keys may prefer a vetted library: the signatures are standard Ed25519 and verify here all the same.
 - **No wall clock.** Time is a logical tick supplied by the caller, so the whole plane is deterministic and testable. Time never moves backwards: a tick earlier than the latest one seen is treated as the latest.
-- **You apply the changes.** floodwall decides; it does not execute. An admitted intent is in flight until you call `complete`, so report back even when a change fails or times out.
+- **You apply the changes.** floodwall decides; it does not execute. An admitted intent is in flight until you call `complete`, so report back even when a change fails or times out. A lease (`SchedulerConfig::with_lease`) reports, or fails, what is not reported back in time.
 - **`unsafe` is forbidden** at the crate level.
-- **Tested against its own spec.** Besides unit tests and these README examples (compiled as doctests), [`tests/scheduler_invariants.rs`](tests/scheduler_invariants.rs) runs 300 seeded random floods and checks every scheduling, conflict and hold guarantee above after each step.
+- **Tested against its own spec.** Besides unit tests and these README examples (compiled as doctests), [`tests/scheduler_invariants.rs`](tests/scheduler_invariants.rs) runs 300 seeded random floods and checks every scheduling, conflict and hold guarantee above after each step, [`tests/replay_property.rs`](tests/replay_property.rs) checks that replaying a ledger reproduces the live decisions, through random restarts and crashes, [`tests/stats_property.rs`](tests/stats_property.rs) checks the plane's stats are exactly what its calls returned, and [`tests/production_policies.rs`](tests/production_policies.rs) checks the worked example's rules decide exactly as their Rego does.
 
 ## License
 

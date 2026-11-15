@@ -5,8 +5,18 @@
 Cargo.lock
 .DS_Store
 npm-debug.log*
+/preview-dist
+/site/.env*.local
+/api/node_modules
+/api/dist
+/api/.wrangler
+/api/.dev.vars
+/api/src/floodwall.wasm
 
 # Local Claude Code session config
 /.claude/
 /site/.ssr
 *.tsbuildinfo
+/sdk/python/dist
+/sdk/python/*.egg-info
+/sdk/typescript/*.tgz

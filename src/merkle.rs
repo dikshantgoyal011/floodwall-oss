@@ -82,6 +82,106 @@ fn path(m: usize, leaves: &[Digest], out: &mut Vec<Digest>) {
     }
 }
 
+/// The inclusion proof for leaf `index` in the tree over the leaves
+/// `before` covers followed by `after`, when only the frontier `before` of
+/// the earlier leaves is known: the proof [`inclusion_proof`] gives over
+/// all of them. `None` unless `index` is one of `after`'s.
+///
+/// Every node a proof for a later leaf needs is either over later leaves or
+/// over whole subtrees `before` holds the roots of, so the earlier leaves
+/// themselves are never needed.
+pub(crate) fn inclusion_proof_after(
+    before: &Frontier,
+    after: &[Digest],
+    index: u64,
+) -> Option<Vec<Digest>> {
+    let base = before.size();
+    let size = base.checked_add(after.len() as u64)?;
+    if index < base || index >= size {
+        return None;
+    }
+    // Where each peak's subtree starts: one per set bit of the size,
+    // largest first.
+    let mut peaks = Vec::with_capacity(before.peaks().len());
+    let mut start = 0u64;
+    for bit in (0..u64::BITS).rev() {
+        if base & (1 << bit) != 0 {
+            peaks.push((start, 1u64 << bit));
+            start += 1 << bit;
+        }
+    }
+    let tree = Partial {
+        base,
+        peaks: peaks
+            .into_iter()
+            .zip(before.peaks().iter().copied())
+            .collect(),
+        after,
+    };
+    let mut proof = Vec::new();
+    tree.path(index, 0, size, &mut proof)?;
+    Some(proof)
+}
+
+/// A tree whose leaves before `base` are known only by the roots of the
+/// perfect subtrees covering them.
+struct Partial<'a> {
+    base: u64,
+    /// Each peak's first leaf, its number of leaves, and its root.
+    peaks: Vec<((u64, u64), Digest)>,
+    after: &'a [Digest],
+}
+
+impl Partial<'_> {
+    /// The root of the subtree over leaves `a..b`.
+    fn root(&self, a: u64, b: u64) -> Option<Digest> {
+        if a >= self.base {
+            let from = usize::try_from(a - self.base).ok()?;
+            let to = usize::try_from(b - self.base).ok()?;
+            return Some(root(self.after.get(from..to)?));
+        }
+        if b <= self.base {
+            // Whole peaks, folded as `Frontier::root` folds them.
+            let covered: Vec<&((u64, u64), Digest)> = self
+                .peaks
+                .iter()
+                .filter(|((start, len), _)| *start >= a && start + len <= b)
+                .collect();
+            let leaves: u64 = covered.iter().map(|((_, len), _)| len).sum();
+            if leaves != b - a {
+                return None; // inside a peak: never needed
+            }
+            let mut roots = covered.iter().rev().map(|(_, d)| *d);
+            let last = roots.next()?;
+            return Some(roots.fold(last, |acc, peak| node_hash(&peak, &acc)));
+        }
+        let k = split_u64(b - a);
+        Some(node_hash(&self.root(a, a + k)?, &self.root(a + k, b)?))
+    }
+
+    /// The audit path for leaf `m` in the subtree over leaves `a..b`.
+    fn path(&self, m: u64, a: u64, b: u64, out: &mut Vec<Digest>) -> Option<()> {
+        if b - a <= 1 {
+            return Some(());
+        }
+        let k = split_u64(b - a);
+        if m < a + k {
+            self.path(m, a, a + k, out)?;
+            out.push(self.root(a + k, b)?);
+        } else {
+            self.path(m, a + k, b, out)?;
+            out.push(self.root(a, a + k)?);
+        }
+        Some(())
+    }
+}
+
+/// The largest power of two strictly below `n` (for `n >= 2`).
+fn split_u64(n: u64) -> u64 {
+    debug_assert!(n >= 2);
+    1 << (u64::BITS - 1 - (n - 1).leading_zeros())
+}
+
 /// Whether `proof` shows that leaf `index` of a tree of `size` leaves holds
 /// `leaf`, in the tree with root `root` (RFC 9162 §2.1.3.2).
 ///
@@ -217,6 +317,31 @@ mod tests {
         (0..n)
             .map(|i| Digest(sha256(i.to_string().as_bytes())))
             .collect()
+    }
+
+    #[test]
+    fn proofs_from_a_frontier_match_proofs_from_every_leaf() {
+        for size in 1..=40 {
+            let all = leaves(size);
+            for base in 0..=size {
+                let mut before = Frontier::new();
+                for leaf in &all[..base] {
+                    before.push(leaf);
+                }
+                for m in 0..size {
+                    let got = inclusion_proof_after(&before, &all[base..], m as u64);
+                    if m < base {
+                        assert_eq!(got, None, "size {size} base {base} leaf {m}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            inclusion_proof(&all, m),
+                            "size {size} base {base} leaf {m}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

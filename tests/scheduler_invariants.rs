@@ -4,7 +4,9 @@
 //! around an Admission that already has work queued and a clock that has
 //! moved on), floods it with
 //! random intents from several agents, ticks it, completes in-flight work
-//! at random, and has a human release or expire held intents at random.
+//! at random (and, under a lease, sees what it was slow to complete
+//! reported or lapsed), and has a human release or expire held intents at
+//! random. Some planes age what waits, so the order of the queue moves.
 //! After every step it checks the invariants the scheduler and hold queue
 //! document, against an independent model kept by this test.
 
@@ -18,7 +20,7 @@ use floodwall::policy::{BlastNeedsPriority, NoGlobalDestroy, Policy, ResourceAll
 use floodwall::sha256::sha256;
 use floodwall::{audit_suffix, Keyring, Ledger, SigningKey};
 use floodwall::{
-    Admission, Floodwall, Gate, HoldConfig, HoldError, Outcome, RateLimit, Rejected,
+    Admission, Aging, Floodwall, Gate, HoldConfig, HoldError, Lease, Outcome, RateLimit, Rejected,
     SchedulerConfig, Verdict, CONFLICT_CHECK,
 };
 
@@ -113,6 +115,39 @@ fn random_config(rng: &mut Rng) -> SchedulerConfig {
         }
     }
     config
+        .with_lease(*rng.pick(&[
+            None,
+            None,
+            Some(Lease::Report(3)),
+            Some(Lease::Fail(2)),
+            Some(Lease::Fail(6)),
+        ]))
+        .with_aging(*rng.pick(&[
+            None,
+            None,
+            Some(Aging::new(1, Priority::Pager)),
+            Some(Aging::new(3, Priority::Urgent)),
+            Some(Aging::new(8, Priority::Normal)),
+        ]))
+}
+
+/// The priority the test expects a pass to walk an intent at, worked out
+/// from `aging`'s settings alone.
+fn walked_at(aging: Option<Aging>, priority: Priority, waited: u64) -> Priority {
+    let Some(aging) = aging else {
+        return priority;
+    };
+    if priority >= aging.up_to() {
+        return priority;
+    }
+    let ranks = [
+        Priority::Bulk,
+        Priority::Normal,
+        Priority::Urgent,
+        Priority::Pager,
+    ];
+    let rank = (priority as u64 + waited / aging.every()).min(aging.up_to() as u64);
+    ranks[rank as usize]
 }
 
 fn is_wide(i: &Intent) -> bool {
@@ -124,6 +159,9 @@ fn is_wide(i: &Intent) -> bool {
 #[derive(Default)]
 struct Model {
     claims: Vec<(IntentKey, Action, Option<u64>)>,
+    /// Queued intents in the order they joined the queue, with the tick
+    /// each joined it.
+    queue: Vec<(Intent, u64)>,
     /// Intents that are queued, in flight, or held.
     live: HashSet<IntentKey>,
     /// Intents that are held.
@@ -131,10 +169,12 @@ struct Model {
     /// Intents released from hold and not yet ruled on again.
     released: HashSet<IntentKey>,
     /// Ledger records the plane should have written, by kind.
+    arrivals: usize,
     decisions: usize,
     completions: usize,
     releases: usize,
     expiries: usize,
+    lapses: usize,
 }
 
 impl Model {
@@ -144,6 +184,25 @@ impl Model {
                 && done.is_none_or(|d| now < d.saturating_add(window))
                 && action.contradicts(&intent.action)
         })
+    }
+
+    /// The queue in the order a pass at tick `now` walks it: highest
+    /// priority first (as aged by `now`), then in the order intents joined.
+    fn walk(&self, aging: Option<Aging>, now: u64) -> Vec<Intent> {
+        let mut order: Vec<(Priority, usize, &Intent)> = self
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(joined, (intent, since))| {
+                (
+                    walked_at(aging, intent.priority, now - since),
+                    joined,
+                    intent,
+                )
+            })
+            .collect();
+        order.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        order.into_iter().map(|(_, _, i)| i.clone()).collect()
     }
 }
 
@@ -203,6 +262,11 @@ struct Coverage {
     overtaking_checks: usize,
     /// More than one narrow intent in flight on one resource at once.
     shared_resource_moments: usize,
+    /// Passes that ruled on something while aging had put the queue in
+    /// another order than strict priority would.
+    aged_passes: usize,
+    /// Intents ruled on ahead of one of higher priority, by aging.
+    aged_ahead: usize,
     failures_reported: usize,
     deferred_and_held: usize,
     released: usize,
@@ -212,12 +276,18 @@ struct Coverage {
     released_but_rejected: usize,
     expired_by_tick: usize,
     expired_by_human: usize,
+    /// Intents failed by the plane, past their lease.
+    lapsed: usize,
+    /// Overdue intents reported, under a reporting lease.
+    overdue_reported: usize,
     not_held_errors: usize,
     /// Intents already queued in the Admission the plane was built from.
     adopted: usize,
     /// Resubmissions refused because the key was an adopted intent's.
     adopted_duplicates_refused: usize,
     forgeries_refused: usize,
+    /// Signed resubmissions of a done intent's id, refused as replays.
+    replays_refused: usize,
     signed_records: usize,
     suffix_audits: usize,
     inclusion_proofs: usize,
@@ -313,6 +383,9 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
     let mut admission = Admission::new(QUEUE_CAPACITY, RateLimit::new(6.0, 2.0));
     let mut model = Model::default();
     let mut next_id: HashMap<&str, u64> = HashMap::new();
+    // With a keyring, ids are monotonic per agent: the highest id queued
+    // for each agent, below which a signed intent is a replay.
+    let mut marks: HashMap<&str, u64> = HashMap::new();
     // Half the seeds build the plane around an Admission that already has
     // work queued and has seen time pass.
     let start = if rng.chance(50) {
@@ -329,9 +402,12 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
             *id += 1;
             let intent = sign(random_intent(&mut rng, agent, *id));
             let key = intent.key();
-            if admission.submit(intent, start).is_ok() {
+            if admission.submit(intent.clone(), start).is_ok() {
                 cov.adopted += 1;
+                let mark = marks.entry(agent).or_insert(0);
+                *mark = (*mark).max(*id);
                 model.live.insert(key.clone());
+                model.queue.push((intent, start));
                 adopted.insert(key);
             }
         }
@@ -355,6 +431,8 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
         plane = plane.with_keyring(keyring.clone());
     }
     let window = plane.scheduler_config().conflict_window();
+    let lease = plane.scheduler_config().lease();
+    let aging = plane.scheduler_config().aging();
     assert_eq!(
         plane.clock(),
         start,
@@ -389,7 +467,7 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
                     intent = intent.signed(&keys[other]);
                 }
                 let key = intent.key();
-                let result = plane.submit(intent, now);
+                let result = plane.submit(intent.clone(), now);
                 if forged {
                     assert_eq!(
                         result,
@@ -400,13 +478,32 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
                     continue;
                 }
                 match result {
-                    Ok(()) => assert!(model.live.insert(key), "seed {seed}: accepted a live key"),
+                    Ok(()) => {
+                        if signed {
+                            assert!(
+                                marks.get(agent).is_none_or(|&m| id > m),
+                                "seed {seed}: accepted a replayed id"
+                            );
+                            let mark = marks.entry(agent).or_insert(id);
+                            *mark = (*mark).max(id);
+                        }
+                        assert!(model.live.insert(key), "seed {seed}: accepted a live key");
+                        model.queue.push((intent, now));
+                        model.arrivals += 1;
+                    }
                     Err(Rejected::Duplicate) => {
                         cov.duplicates_refused += 1;
                         if adopted.contains(&key) {
                             cov.adopted_duplicates_refused += 1;
                         }
-                        assert!(model.live.contains(&key), "seed {seed}: false duplicate")
+                        let replay = signed && marks.get(agent).is_some_and(|&m| id <= m);
+                        if replay && !model.live.contains(&key) {
+                            cov.replays_refused += 1;
+                        }
+                        assert!(
+                            model.live.contains(&key) || replay,
+                            "seed {seed}: false duplicate"
+                        )
                     }
                     Err(Rejected::RateLimited | Rejected::Backpressure) => {}
                     Err(
@@ -418,10 +515,76 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
             }
         }
 
-        let before: Vec<Intent> = plane.queued().cloned().collect();
+        // The queue is in the order the model expects: as a pass at the
+        // plane's clock would walk it, and, at this tick, as this one does.
+        let keys = |intents: &[Intent]| intents.iter().map(Intent::key).collect::<Vec<_>>();
+        let queued: Vec<IntentKey> = plane.queued().map(Intent::key).collect();
+        assert_eq!(
+            queued,
+            keys(&model.walk(aging, plane.clock())),
+            "seed {seed}: queued() is not in the order of a pass"
+        );
+        let before = model.walk(aging, now);
+        let overdue_before: Vec<IntentKey> = plane
+            .in_flight()
+            .filter(|f| lease.is_some_and(|l| now >= f.since.saturating_add(l.ticks())))
+            .map(|f| f.intent.key())
+            .collect();
         let report = plane.tick(now);
         let ruled: HashSet<IntentKey> = report.decisions.iter().map(|d| d.intent.key()).collect();
         check_no_overtaking(&before, &ruled, seed, cov);
+        // The pass ruled on what it could start in the order it walked.
+        let in_order: Vec<IntentKey> = keys(&before)
+            .into_iter()
+            .filter(|k| ruled.contains(k))
+            .collect();
+        let decided: Vec<IntentKey> = report.decisions.iter().map(|d| d.intent.key()).collect();
+        assert_eq!(decided, in_order, "seed {seed}: ruled on out of order");
+        if !decided.is_empty() && keys(&before) != keys(&model.walk(None, now)) {
+            cov.aged_passes += 1;
+        }
+        for d in &report.decisions {
+            let at = before
+                .iter()
+                .position(|x| x.key() == d.intent.key())
+                .unwrap();
+            if before[at + 1..]
+                .iter()
+                .any(|x| x.priority > d.intent.priority)
+            {
+                cov.aged_ahead += 1;
+            }
+        }
+        model.queue.retain(|(i, _)| !ruled.contains(&i.key()));
+
+        // Leases are dealt with before the pass: exactly what was in flight
+        // past its lease is reported, or lapsed, and a lapse closes its
+        // claim as a completion does.
+        let reported: Vec<IntentKey> = report.overdue.iter().map(|f| f.intent.key()).collect();
+        let lapsed: Vec<IntentKey> = report.lapsed.iter().map(|f| f.intent.key()).collect();
+        match lease {
+            Some(Lease::Report(_)) => {
+                assert_eq!(reported, overdue_before, "seed {seed}: overdue");
+                assert!(lapsed.is_empty(), "seed {seed}: lapsed under Report");
+                cov.overdue_reported += reported.len();
+            }
+            Some(Lease::Fail(_)) => {
+                assert_eq!(lapsed, overdue_before, "seed {seed}: lapsed");
+                assert!(reported.is_empty(), "seed {seed}: reported under Fail");
+            }
+            None => assert!(reported.is_empty() && lapsed.is_empty(), "seed {seed}"),
+        }
+        for key in lapsed {
+            cov.lapsed += 1;
+            model.lapses += 1;
+            model.live.remove(&key);
+            let claim = model
+                .claims
+                .iter_mut()
+                .find(|(k, _, done)| *k == key && done.is_none())
+                .expect("model has the claim");
+            claim.2 = Some(now);
+        }
 
         for d in &report.decisions {
             model.decisions += 1;
@@ -489,9 +652,18 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
         }
         check_hold(&plane, &model, seed);
         check_in_flight(&plane, seed, cov);
+        if let Some(Lease::Fail(ticks)) = lease {
+            assert!(
+                plane
+                    .in_flight()
+                    .all(|f| now < f.since.saturating_add(ticks)),
+                "seed {seed}: in flight past its lease"
+            );
+        }
         // Maximal: a second pass at the same tick finds nothing new.
+        let again = plane.tick(now);
         assert!(
-            plane.tick(now).decisions.is_empty(),
+            again.decisions.is_empty() && again.lapsed.is_empty() && again.expired.is_empty(),
             "seed {seed}: a pass left ready work waiting"
         );
 
@@ -524,12 +696,18 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
         for key in held {
             let roll = rng.below(100);
             if roll < 15 || (!flooding && roll < 60) {
+                let intent = plane
+                    .held()
+                    .find(|h| h.intent.key() == key)
+                    .map(|h| h.intent.clone())
+                    .expect("held");
                 match plane.release(&key, "ops", now) {
                     Ok(()) => {
                         cov.released += 1;
                         model.releases += 1;
                         model.held.remove(&key);
                         model.released.insert(key);
+                        model.queue.push((intent, now));
                     }
                     Err(HoldError::Backpressure(k)) => {
                         assert_eq!(k, key);
@@ -581,8 +759,13 @@ fn run_with(seed: u64, cov: &mut Coverage, signed: bool) {
     );
     assert_eq!(
         plane.ledger().len(),
-        model.decisions + model.completions + model.releases + model.expiries,
-        "seed {seed}: one record per decision, completion, release and expiry"
+        model.arrivals
+            + model.decisions
+            + model.completions
+            + model.releases
+            + model.expiries
+            + model.lapses,
+        "seed {seed}: one record per arrival, decision, completion, release, expiry and lapse"
     );
     assert!(plane.ledger().verify(), "seed {seed}: ledger chain broken");
     if signed {
@@ -654,6 +837,8 @@ fn scheduler_invariants_hold_across_random_floods() {
     assert!(cov.globals_dispatched > 10, "{cov:?}");
     assert!(cov.overtaking_checks > 1_000, "{cov:?}");
     assert!(cov.shared_resource_moments > 100, "{cov:?}");
+    assert!(cov.aged_passes > 100, "{cov:?}");
+    assert!(cov.aged_ahead > 100, "{cov:?}");
     assert!(cov.failures_reported > 100, "{cov:?}");
     assert!(cov.deferred_and_held > 1_000, "{cov:?}");
     assert!(cov.released > 500, "{cov:?}");
@@ -661,6 +846,8 @@ fn scheduler_invariants_hold_across_random_floods() {
     assert!(cov.released_but_rejected > 0, "{cov:?}");
     assert!(cov.expired_by_tick > 100, "{cov:?}");
     assert!(cov.expired_by_human > 100, "{cov:?}");
+    assert!(cov.lapsed > 100, "{cov:?}");
+    assert!(cov.overdue_reported > 100, "{cov:?}");
     assert!(cov.adopted > 1_000, "{cov:?}");
     assert!(cov.adopted_duplicates_refused > 10, "{cov:?}");
     assert!(cov.suffix_audits > 1_000, "{cov:?}");
@@ -677,6 +864,7 @@ fn signed_floods_keep_every_record_attributable() {
     }
     eprintln!("{cov:#?}");
     assert!(cov.forgeries_refused > 10, "{cov:?}");
+    assert!(cov.replays_refused > 0, "{cov:?}");
     assert!(cov.signed_records > 500, "{cov:?}");
     assert!(
         cov.released > 0 && cov.expired_by_tick + cov.expired_by_human > 0,
