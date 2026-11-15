@@ -1,0 +1,44 @@
+name: publish-python
+
+# Publishes the Python client (sdk/python) to PyPI when a tag like
+# sdk-python-v0.1.0 is pushed. It uses PyPI's Trusted Publishing: PyPI
+# trusts this workflow's GitHub identity, so no API token is stored anywhere.
+# The tag's version must match sdk/python/pyproject.toml.
+
+on:
+  push:
+    tags:
+      - "sdk-python-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: version matches the tag
+        working-directory: sdk/python
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          test "sdk-python-v$version" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - name: test
+        working-directory: sdk/python
+        run: python3 -m unittest discover -s tests -t .
+      - name: build
+        working-directory: sdk/python
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: sdk/python/dist

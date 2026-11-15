@@ -12,10 +12,30 @@
       "default": "./src/index.js"
     }
   },
-  "files": ["src"],
-  "engines": { "node": ">=20" },
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
-  "repository": { "type": "git", "url": "https://github.com/erphq/floodwall", "directory": "sdk/typescript" }
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/erphq/floodwall",
+    "directory": "sdk/typescript"
+  },
+  "keywords": [
+    "floodwall",
+    "agents",
+    "devops",
+    "policy",
+    "change-management"
+  ],
+  "homepage": "https://floodwall.ai",
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -3,6 +3,10 @@
 Ask a Floodwall Cloud plane before your agent changes production, and tell it
 how the change went. Standard library only; Python 3.9+.
 
+```sh
+pip install floodwall
+```
+
 ```python
 from floodwall import Floodwall
 
@@ -43,3 +47,6 @@ rejected, expires or lapses. Rate limits (HTTP 429) are waited out.
   `pip install floodwall[signing]`.
 
 Tests: `python3 -m unittest discover -s tests -t .`
+
+Releases: bump `version` in `pyproject.toml`, then push a tag `sdk-python-v<version>`;
+the `publish-python` workflow publishes it to PyPI (Trusted Publishing, no token).

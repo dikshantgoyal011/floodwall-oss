@@ -37,7 +37,7 @@ to agents.
 
 ## 4. Ask before changing
 
-TypeScript (`sdk/typescript`, `@floodwall/client`):
+TypeScript (`npm install @floodwall/client`, source in `sdk/typescript`):
 
 ```js
 import { Floodwall } from "@floodwall/client";
@@ -50,7 +50,7 @@ await fw.guard(
 );
 ```
 
-Python (`sdk/python`, `floodwall`):
+Python (`pip install floodwall`, source in `sdk/python`):
 
 ```python
 from floodwall import Floodwall

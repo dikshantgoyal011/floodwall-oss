@@ -4,6 +4,10 @@ Ask a Floodwall Cloud plane before your agent changes production, and tell it
 how the change went. No dependencies; Node 20+, Deno, Bun, Workers or a
 current browser.
 
+```sh
+npm install @floodwall/client
+```
+
 ```js
 import { Floodwall } from "@floodwall/client";
 
