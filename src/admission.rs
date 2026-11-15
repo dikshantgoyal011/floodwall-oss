@@ -158,8 +158,11 @@ pub enum Rejected {
     /// The queue is at capacity - backpressure, come back later.
     Backpressure,
     /// An intent with the same agent and id is already live (queued, in
-    /// flight, or held). Returned by [`Floodwall::submit`](crate::Floodwall::submit);
-    /// [`Admission`] itself does not track identity.
+    /// flight, or held), or, on a plane with a keyring, the id is not above
+    /// the highest id already queued for the agent: ids are monotonic per
+    /// agent, so it is a replay. Returned by
+    /// [`Floodwall::submit`](crate::Floodwall::submit); [`Admission`] itself
+    /// does not track identity.
     Duplicate,
     /// The plane requires signed intents and this one carries no signature.
     /// Returned by [`Floodwall::submit`](crate::Floodwall::submit) with a
