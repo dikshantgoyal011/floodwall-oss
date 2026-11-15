@@ -49,6 +49,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   history's keys, retired ones included, and could admit an intent signed
   only with the retired key. They are now checked against the current
   keyring, like any decision made after a restart.
+- `tools/verify-ledger.mjs` given a plane key now requires every record to
+  be covered by a checkpoint the plane signed. Before, it checked the
+  signatures of the checkpoints present only, so whoever held an export
+  could remove its checkpoints, rewrite verdicts and re-hash the records,
+  and the verifier still printed "every checkpoint signature verified".
+  To check a ledger still being written, pass `--allow-uncovered-tail`:
+  the summary then says how many records no signed checkpoint covers.
+  Without a plane key, nothing changes.
+
 
 ### Added
 

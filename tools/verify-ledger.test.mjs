@@ -48,10 +48,10 @@ const scratch = mkdtempSync(join(tmpdir(), "verify-ledger-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
 const script = fileURLToPath(new URL("./verify-ledger.mjs", import.meta.url));
 /** Run the CLI on files with these contents (keys null: omit the argument). */
-const cli = (ledgerText, keysText = null) => {
+const cli = (ledgerText, keysText = null, flags = []) => {
   const ledgerPath = join(scratch, "ledger.jsonl");
   writeFileSync(ledgerPath, ledgerText);
-  const args = [script, ledgerPath];
+  const args = [script, ...flags, ledgerPath];
   if (keysText !== null) {
     const keysPath = join(scratch, "keys.json");
     writeFileSync(keysPath, keysText);
@@ -235,7 +235,85 @@ test("a suffix export cut off before its checkpoint is refused", () => {
   // after its checkpoint.
   assert.doesNotThrow(() => verifyLedger(join_([lines(whole)[0]])));
   const tail = lines(suffix).filter((l, n) => n < 2 || l.includes('"type":"record"'));
-  assert.equal(verifyLedger(join_(tail), keys).checkpoints, 1);
+  assert.equal(verifyLedger(join_(tail), null).checkpoints, 1);
+  // With the plane's key, those records need a signed checkpoint, unless
+  // the auditor accepts an uncovered tail.
+  fails(join_(tail), keys, /records \d+\.\.\d+ are not covered by a checkpoint signed by the plane/);
+  assert.equal(verifyLedger(join_(tail), keys, { allowUncoveredTail: true }).checkpoints, 1);
+});
+
+/** `text` with every checkpoint line removed and the record whose verdict
+ * is `from` changed to `to`, every digest and link after it recomputed:
+ * what anyone holding the export can produce without the plane's key. */
+const strippedAndRewritten = (text, from, to, keep = 0) => {
+  const out = [];
+  let prev = null;
+  let rewritten = false;
+  for (const [n, line] of lines(text).entries()) {
+    const obj = JSON.parse(line);
+    if (obj.type === "checkpoint") {
+      if (obj.size <= keep && obj.size > 0 && !rewritten) out.push(line);
+      continue;
+    }
+    if (obj.type === "record") {
+      if (prev !== null) obj.prev = prev;
+      if (!rewritten && obj.seq >= keep && obj.verdict === from) {
+        obj.verdict = to;
+        rewritten = true;
+      }
+      obj.digest = recordDigest(obj);
+      prev = obj.digest;
+      out.push(JSON.stringify(obj));
+    } else {
+      assert.equal(n, 0);
+      out.push(line);
+    }
+  }
+  assert.ok(rewritten, `no ${from} record to rewrite`);
+  return join_(out);
+};
+
+test("with the plane's key, every record must be covered by a signed checkpoint", () => {
+  // Audit lead: strip the plane's checkpoints, then rewrite a verdict and
+  // re-hash. The hashes and agent signatures all still check out.
+  const forged = strippedAndRewritten(whole, "reject", "admit");
+  assert.equal(verifyLedger(forged, null).checkpoints, 0);
+  const noPlane = { ...keys, plane: null };
+  assert.doesNotThrow(() => verifyLedger(forged, noPlane));
+  fails(forged, keys, /none of its \d+ records is covered by a checkpoint signed by the plane/);
+  let r = cli(forged, JSON.stringify(keys));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /covered by a checkpoint signed by the plane/);
+  // Keeping the early checkpoints and rewriting after them is caught too.
+  const sizes = recordLines(whole).length;
+  const keep = lines(whole)
+    .map((l) => JSON.parse(l))
+    .filter((o) => o.type === "checkpoint" && o.size > 0 && o.size < sizes)
+    .at(0).size;
+  const partly = strippedAndRewritten(whole, "reject", "admit", keep);
+  fails(partly, keys, new RegExp(`records ${keep}\\.\\.${sizes} are not covered`));
+  // Accepting an uncovered tail says how much of the file is unvouched.
+  r = cli(partly, JSON.stringify(keys), ["--allow-uncovered-tail"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`WARNING: ${sizes - keep} records after the last signed checkpoint \\(at ${keep}\\)`));
+  // A genuine export is covered to its end.
+  r = cli(whole, JSON.stringify(keys));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /ok: every record is covered by a checkpoint signed by the plane/);
+  r = cli(forged, JSON.stringify(keys), ["--allow-uncovered-tail"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /WARNING: no checkpoint signed by the plane covers any of the \d+ records/);
+  assert.doesNotMatch(r.stdout, /every checkpoint signature/);
+  // An unknown option is a usage error, not a ledger path.
+  for (const option of ["--allow-uncovered", "-h"]) {
+    r = cli(whole, JSON.stringify(keys), [option]);
+    assert.equal(r.status, 2, option);
+  }
+  assert.doesNotThrow(() => verifyLedger(whole, keys, null));
+  // A suffix export with nothing after its trusted checkpoint is covered.
+  const bare = join_(lines(suffix).slice(0, 2));
+  const s = verifyLedger(bare, keys);
+  assert.equal(s.covered, s.size);
 });
 
 test("records are checked against the exact schema before hashing", () => {

@@ -280,9 +280,10 @@ $ cargo run --release -- --export audit/      # the demo writes ledger.jsonl, le
 $ node tools/verify-ledger.mjs audit/ledger.jsonl audit/keys.json
 ok: 2989 records from genesis; 12 checkpoints; head d68d4329…
 ok: 2989 agent signatures and every checkpoint signature verified
+ok: every record is covered by a checkpoint signed by the plane
 ```
 
-[`tools/verify-ledger.mjs`](tools/verify-ledger.mjs) is an independent implementation using only Node's standard library. It refuses anything not written exactly in the documented format, recomputes every record and intent digest, checks every link, Merkle root and frontier and that every record shows the intent it holds, and with the public keys (current and retired) checks every agent and checkpoint signature. A suffix export (`Ledger::export_jsonl_from(checkpoint)`) is checked from that checkpoint alone. A ledger file on disk is checked the same way: it is the same bytes as `ledger.jsonl`. CI runs it on every change.
+[`tools/verify-ledger.mjs`](tools/verify-ledger.mjs) is an independent implementation using only Node's standard library. It refuses anything not written exactly in the documented format, recomputes every record and intent digest, checks every link, Merkle root and frontier and that every record shows the intent it holds, and with the public keys (current and retired) checks every agent and checkpoint signature. With the plane's key it also requires every record to be covered by a checkpoint the plane signed, since only those vouch for the verdicts: an export whose checkpoints were removed is refused, and a ledger still being written can be checked with `--allow-uncovered-tail`, which reports how many records are not yet covered. Coverage is not completeness: an export cut short at an earlier signed checkpoint still verifies, so compare the head and size it prints with a checkpoint you got from the plane another way. A suffix export (`Ledger::export_jsonl_from(checkpoint)`) is checked from that checkpoint alone. A ledger file on disk is checked the same way: it is the same bytes as `ledger.jsonl`. CI runs it on every change.
 
 Writing your own policy is one trait method:
 
