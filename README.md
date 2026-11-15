@@ -41,6 +41,10 @@ You cannot review your way out of that. You have to **govern throughput**: admit
 
 The unit that flows through all of it is an [`Intent`](src/intent.rs): a change an agent *wants* to make, fully attributed, tagged with how urgent it is (`Priority`) and how much it can break (`BlastRadius`). Agents never touch production directly. They submit intents. The floodwall decides what runs, when, and alongside what; the caller applies each admitted change and reports back.
 
+## Floodwall Cloud
+
+To use a hosted plane instead of embedding the crate, follow the [Quickstart](QUICKSTART.md): make a plane and a key in the console, then wrap each change your agent makes in `guard()` from the [TypeScript](sdk/typescript) or [Python](sdk/python) client.
+
 ## Use
 
 ```rust

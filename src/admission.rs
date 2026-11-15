@@ -248,6 +248,17 @@ impl Admission {
         }
     }
 
+    /// Change every agent's rate limit from now on (see
+    /// [`crate::reconfigure`]). Each agent keeps the tokens it has saved,
+    /// up to the new burst. The caller has validated `limit`.
+    pub(crate) fn set_rate_limit(&mut self, limit: RateLimit) {
+        debug_assert!(limit.validate().is_ok());
+        for bucket in self.buckets.values_mut() {
+            bucket.tokens = bucket.tokens.min(limit.burst);
+        }
+        self.limit = limit;
+    }
+
     /// Advance the clock to `now` and return the effective time: `now`, or
     /// the clock if `now` is earlier. Every time-taking method calls this
     /// before touching any other state.
@@ -381,6 +392,90 @@ impl Admission {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Everything the controller tracks, for a [snapshot](crate::snapshot).
+    pub(crate) fn state(&self) -> AdmissionState {
+        let mut buckets: Vec<(AgentId, f64, u64)> = self
+            .buckets
+            .iter()
+            .map(|(agent, b)| (agent.clone(), b.tokens, b.last))
+            .collect();
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        AdmissionState {
+            seq: self.seq,
+            prune_at: self.prune_at as u64,
+            clock: self.clock,
+            queue: self
+                .queue
+                .iter()
+                .map(|(key, intent)| (key.seq, key.since, intent.clone()))
+                .collect(),
+            buckets,
+        }
+    }
+
+    /// Take up `state` in place of what the controller tracks, keeping its
+    /// capacity and rate limit. Fails, changing nothing, if it holds more
+    /// than the capacity, or is not a state a controller could be in.
+    pub(crate) fn restore(&mut self, state: &AdmissionState) -> Result<(), String> {
+        if state.queue.len() > self.capacity {
+            return Err(format!(
+                "{} intents are queued, but the queue holds at most {}",
+                state.queue.len(),
+                self.capacity
+            ));
+        }
+        let mut queue = BTreeMap::new();
+        for (seq, since, intent) in &state.queue {
+            let key = QueueKey {
+                priority: Reverse(intent.priority),
+                seq: *seq,
+                since: *since,
+            };
+            if *seq >= state.seq || queue.insert(key, intent.clone()).is_some() {
+                return Err(format!("queue position {seq} is out of place"));
+            }
+        }
+        let mut buckets = HashMap::new();
+        for (agent, tokens, last) in &state.buckets {
+            if !tokens.is_finite() || buckets.contains_key(agent) {
+                return Err(format!(
+                    "{agent}'s rate-limit bucket is not one a plane keeps"
+                ));
+            }
+            buckets.insert(
+                agent.clone(),
+                Bucket {
+                    tokens: *tokens,
+                    last: *last,
+                },
+            );
+        }
+        let prune_at =
+            usize::try_from(state.prune_at).map_err(|_| "prune_at is too large".to_string())?;
+        self.queue = queue;
+        self.seq = state.seq;
+        self.prune_at = prune_at;
+        self.clock = state.clock;
+        self.buckets = buckets;
+        Ok(())
+    }
+}
+
+/// What a [snapshot](crate::snapshot) keeps of an [`Admission`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AdmissionState {
+    /// The position the next intent to join the queue takes.
+    pub(crate) seq: u64,
+    /// How many agents' buckets it may track before pruning idle ones.
+    pub(crate) prune_at: u64,
+    pub(crate) clock: u64,
+    /// Each queued intent, in queue order, with its position and the tick
+    /// it joined at.
+    pub(crate) queue: Vec<(u64, u64, Intent)>,
+    /// Each tracked agent's bucket, by agent: its tokens and the tick they
+    /// were counted at.
+    pub(crate) buckets: Vec<(AgentId, f64, u64)>,
 }
 
 #[cfg(test)]

@@ -101,7 +101,7 @@ pub const VERSION: u64 = 1;
 
 /// Write `s` as a JSON string: quotes and backslashes escaped, control
 /// characters as escapes, everything else as UTF-8.
-fn json_str(out: &mut String, s: &str) {
+pub(crate) fn json_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -134,11 +134,34 @@ pub(crate) fn header(from: u64) -> String {
     )
 }
 
-fn intent_json(s: &mut String, i: &Intent) {
+pub(crate) fn intent_json(s: &mut String, i: &Intent) {
     s.push_str(&format!("{{\"id\":\"{}\",\"agent\":", i.id));
     json_str(s, i.agent.as_str());
-    s.push_str(",\"action\":{\"kind\":");
-    match &i.action {
+    s.push_str(",\"action\":");
+    action_json(s, &i.action);
+    let priority = match i.priority {
+        Priority::Bulk => "bulk",
+        Priority::Normal => "normal",
+        Priority::Urgent => "urgent",
+        Priority::Pager => "pager",
+    };
+    let blast = match i.blast_radius {
+        BlastRadius::Cell => "cell",
+        BlastRadius::Service => "service",
+        BlastRadius::Region => "region",
+        BlastRadius::Global => "global",
+    };
+    s.push_str(&format!(
+        ",\"priority\":\"{priority}\",\"blast_radius\":\"{blast}\",\"signature\":"
+    ));
+    json_opt_str(s, i.signature.map(|sig| sig.to_string()).as_deref());
+    s.push('}');
+}
+
+/// An intent's action, in the export's intent form.
+pub(crate) fn action_json(s: &mut String, action: &Action) {
+    s.push_str("{\"kind\":");
+    match action {
         Action::Apply { resource, manifest } => {
             s.push_str("\"apply\",\"resource\":");
             json_str(s, resource);
@@ -155,22 +178,6 @@ fn intent_json(s: &mut String, i: &Intent) {
             json_str(s, resource);
         }
     }
-    let priority = match i.priority {
-        Priority::Bulk => "bulk",
-        Priority::Normal => "normal",
-        Priority::Urgent => "urgent",
-        Priority::Pager => "pager",
-    };
-    let blast = match i.blast_radius {
-        BlastRadius::Cell => "cell",
-        BlastRadius::Service => "service",
-        BlastRadius::Region => "region",
-        BlastRadius::Global => "global",
-    };
-    s.push_str(&format!(
-        "}},\"priority\":\"{priority}\",\"blast_radius\":\"{blast}\",\"signature\":"
-    ));
-    json_opt_str(s, i.signature.map(|sig| sig.to_string()).as_deref());
     s.push('}');
 }
 
@@ -238,7 +245,14 @@ impl Ledger {
     /// Write the whole ledger as JSON Lines (see [`crate::export`]): a
     /// header, then every record, with each checkpoint after the record
     /// that completes it.
+    ///
+    /// A ledger that starts at a checkpoint ([`Ledger::starting_at`]) has no
+    /// records before it to write, so it writes a suffix export from that
+    /// checkpoint, as [`Ledger::export_jsonl_from`] does.
     pub fn export_jsonl<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        if let Some(start) = self.start() {
+            return self.export_jsonl_from(start, out);
+        }
         writeln!(out, "{}", header(0))?;
         self.write_from(0, false, out)
     }
@@ -275,8 +289,9 @@ impl Ledger {
         while let Some(c) = checkpoints.next_if(|c| c.size == start) {
             writeln!(out, "{}", checkpoint_line(c))?;
         }
-        let start = usize::try_from(start).map_err(|_| io::ErrorKind::InvalidInput)?;
-        for r in self.records().get(start..).unwrap_or_default() {
+        let held = start.saturating_sub(self.size() - self.len() as u64);
+        let held = usize::try_from(held).map_err(|_| io::ErrorKind::InvalidInput)?;
+        for r in self.records().get(held..).unwrap_or_default() {
             writeln!(out, "{}", record_line(r))?;
             while let Some(c) = checkpoints.next_if(|c| c.size == r.seq + 1) {
                 writeln!(out, "{}", checkpoint_line(c))?;
@@ -285,18 +300,28 @@ impl Ledger {
         Ok(())
     }
 
-    /// Whether `c` describes this ledger at `c.size` records.
+    /// Whether `c` describes this ledger at `c.size` records. For a ledger
+    /// that starts at a checkpoint, only sizes from that one on can be
+    /// checked.
     fn matches(&self, c: &Checkpoint) -> bool {
-        let Some(records) = usize::try_from(c.size)
-            .ok()
+        let (mut head, mut frontier, base) = match self.start() {
+            None => (Digest::GENESIS, Frontier::new(), 0),
+            Some(s) => match Frontier::from_parts(s.size, s.frontier.clone()) {
+                Some(frontier) => (s.head, frontier, s.size),
+                None => return false,
+            },
+        };
+        let Some(records) = c
+            .size
+            .checked_sub(base)
+            .and_then(|n| usize::try_from(n).ok())
             .and_then(|n| self.records().get(..n))
         else {
             return false;
         };
-        let head = records.last().map_or(Digest::GENESIS, |r| r.digest);
-        let mut frontier = Frontier::new();
         for r in records {
             frontier.push(&r.digest);
+            head = r.digest;
         }
         c.head == head && c.root == frontier.root() && c.frontier == frontier.peaks()
     }
@@ -390,7 +415,11 @@ pub(crate) fn read_line(line: &str) -> Result<Line, String> {
 }
 
 /// The values of an object that has exactly the fields `names`, in order.
-fn fields<'a>(value: &'a Value, names: &[&str], what: &str) -> Result<Vec<&'a Value>, String> {
+pub(crate) fn fields<'a>(
+    value: &'a Value,
+    names: &[&str],
+    what: &str,
+) -> Result<Vec<&'a Value>, String> {
     let Value::Object(fields) = value else {
         return Err(format!("{what} is {}, not an object", value.kind()));
     };
@@ -418,21 +447,21 @@ fn fields<'a>(value: &'a Value, names: &[&str], what: &str) -> Result<Vec<&'a Va
     Ok(fields.iter().map(|(_, v)| v).collect())
 }
 
-fn string<'a>(value: &'a Value, what: &str) -> Result<&'a str, String> {
+pub(crate) fn string<'a>(value: &'a Value, what: &str) -> Result<&'a str, String> {
     match value {
         Value::String(s) => Ok(s),
         other => Err(format!("{what} is {}, not a string", other.kind())),
     }
 }
 
-fn opt_string(value: &Value, what: &str) -> Result<Option<String>, String> {
+pub(crate) fn opt_string(value: &Value, what: &str) -> Result<Option<String>, String> {
     match value {
         Value::Null => Ok(None),
         other => string(other, what).map(|s| Some(s.to_string())),
     }
 }
 
-fn number(value: &Value, what: &str) -> Result<u64, String> {
+pub(crate) fn number(value: &Value, what: &str) -> Result<u64, String> {
     match value {
         Value::Number(n) => Ok(*n),
         other => Err(format!("{what} is {}, not a number", other.kind())),
@@ -440,7 +469,7 @@ fn number(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// A `u64` written as a decimal string, the way `intent_id` is.
-fn decimal(value: &Value, what: &str) -> Result<u64, String> {
+pub(crate) fn decimal(value: &Value, what: &str) -> Result<u64, String> {
     let s = string(value, what)?;
     let canonical = s == "0" || (!s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()));
     match s.parse::<u64>() {
@@ -450,7 +479,7 @@ fn decimal(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// `N` bytes written as lowercase hex.
-fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
+pub(crate) fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
     let s = string(value, what)?;
     let digit = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -514,7 +543,7 @@ fn read_header(value: &Value) -> Result<u64, String> {
     Ok(from)
 }
 
-fn read_intent(value: &Value) -> Result<Intent, String> {
+pub(crate) fn read_intent(value: &Value) -> Result<Intent, String> {
     let f = fields(
         value,
         &[
@@ -527,38 +556,7 @@ fn read_intent(value: &Value) -> Result<Intent, String> {
         ],
         "intent",
     )?;
-    let kind = match f[2] {
-        Value::Object(fields) => match fields.first() {
-            Some((key, Value::String(kind))) if key == "kind" => kind.as_str(),
-            _ => "",
-        },
-        _ => "",
-    };
-    let action = match kind {
-        "apply" => {
-            let a = fields(f[2], &["kind", "resource", "manifest"], "intent.action")?;
-            Action::Apply {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-                manifest: string(a[2], "intent.action.manifest")?.to_string(),
-            }
-        }
-        "scale" => {
-            let a = fields(f[2], &["kind", "resource", "replicas"], "intent.action")?;
-            let replicas = number(a[2], "intent.action.replicas")?;
-            Action::Scale {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-                replicas: u32::try_from(replicas)
-                    .map_err(|_| "intent.action.replicas is not a u32".to_string())?,
-            }
-        }
-        "destroy" => {
-            let a = fields(f[2], &["kind", "resource"], "intent.action")?;
-            Action::Destroy {
-                resource: string(a[1], "intent.action.resource")?.to_string(),
-            }
-        }
-        _ => return Err("intent.action.kind is not \"apply\", \"scale\" or \"destroy\"".into()),
-    };
+    let action = read_action(f[2], "intent.action")?;
     let priority = match string(f[3], "intent.priority")? {
         "bulk" => Priority::Bulk,
         "normal" => Priority::Normal,
@@ -580,6 +578,46 @@ fn read_intent(value: &Value) -> Result<Intent, String> {
         priority,
         blast_radius,
         signature: signature(f[5], "intent.signature")?,
+    })
+}
+
+/// An action in the export's intent form; `what` names it in errors.
+pub(crate) fn read_action(value: &Value, what: &str) -> Result<Action, String> {
+    let kind = match value {
+        Value::Object(fields) => match fields.first() {
+            Some((key, Value::String(kind))) if key == "kind" => kind.as_str(),
+            _ => "",
+        },
+        _ => "",
+    };
+    Ok(match kind {
+        "apply" => {
+            let a = fields(value, &["kind", "resource", "manifest"], what)?;
+            Action::Apply {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+                manifest: string(a[2], &format!("{what}.manifest"))?.to_string(),
+            }
+        }
+        "scale" => {
+            let a = fields(value, &["kind", "resource", "replicas"], what)?;
+            let replicas = number(a[2], &format!("{what}.replicas"))?;
+            Action::Scale {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+                replicas: u32::try_from(replicas)
+                    .map_err(|_| format!("{what}.replicas is not a u32"))?,
+            }
+        }
+        "destroy" => {
+            let a = fields(value, &["kind", "resource"], what)?;
+            Action::Destroy {
+                resource: string(a[1], &format!("{what}.resource"))?.to_string(),
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{what}.kind is not \"apply\", \"scale\" or \"destroy\""
+            ))
+        }
     })
 }
 
@@ -654,7 +692,7 @@ fn read_record(value: &Value) -> Result<Record, String> {
     })
 }
 
-fn read_checkpoint(value: &Value) -> Result<Checkpoint, String> {
+pub(crate) fn read_checkpoint(value: &Value) -> Result<Checkpoint, String> {
     let f = fields(
         value,
         &["type", "size", "head", "root", "frontier", "signature"],

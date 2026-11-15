@@ -11,6 +11,7 @@ npm-debug.log*
 /api/dist
 /api/.wrangler
 /api/.dev.vars
+/api/src/floodwall.wasm
 
 # Local Claude Code session config
 /.claude/

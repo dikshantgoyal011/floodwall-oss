@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "floodwall"
+version = "0.1.0"
+description = "Ask a Floodwall Cloud plane before your agent changes production."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+# Only for planes that require signed intents.
+signing = ["cryptography>=41"]
+
+[project.urls]
+Repository = "https://github.com/erphq/floodwall"

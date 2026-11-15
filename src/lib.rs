@@ -66,17 +66,20 @@ pub mod ed25519;
 pub mod export;
 pub mod gate;
 pub mod hold;
+pub mod host;
 pub mod intent;
 mod json;
 pub mod keyring;
 pub mod ledger;
 pub mod merkle;
 pub mod policy;
+pub mod reconfigure;
 pub mod replay;
 pub mod rules;
 pub mod scheduler;
 pub mod sha256;
 pub mod sha512;
+pub mod snapshot;
 pub mod stats;
 
 use std::cmp::Reverse;
@@ -94,9 +97,11 @@ pub use keyring::{AuthError, Keyring};
 pub use ledger::{Digest, Evidence, Ledger, Record, SignatureError, SignatureProblem};
 pub use merkle::FrontierFull;
 pub use policy::{Policy, Verdict};
+pub use reconfigure::Settings;
 pub use replay::ResumeError;
 pub use rules::BundleId;
 pub use scheduler::{Aging, InFlight, Lease, SchedulerConfig};
+pub use snapshot::Snapshot;
 pub use stats::{Counts, Stats};
 
 use admission::QueueKey;
@@ -276,6 +281,10 @@ pub struct Floodwall {
     /// What the plane has done since it was built or resumed (see
     /// [`crate::stats`]).
     counters: Counters,
+    /// The label of the settings in force: the latest
+    /// [`reconfigure`](Floodwall::reconfigure)'s, or the one given to
+    /// [`Floodwall::with_settings_label`]. Snapshots record it.
+    settings_label: Option<String>,
     clock: u64,
 }
 
@@ -328,6 +337,7 @@ impl Floodwall {
             signed_ids: BTreeMap::new(),
             replayed_checks: None,
             replayed_bundles: None,
+            settings_label: None,
         })
     }
 
@@ -368,6 +378,22 @@ impl Floodwall {
         self.keyring = Some(keyring);
         self.authenticated.clear();
         self
+    }
+
+    /// Name the settings this plane was built with `label`, as
+    /// [`Floodwall::reconfigure`] names the settings it changes to. A
+    /// [`Snapshot`] records the label of the settings in force, so a plane
+    /// resumed from it can be given them again (see [`crate::snapshot`]).
+    pub fn with_settings_label(mut self, label: impl Into<String>) -> Self {
+        self.settings_label = Some(label.into());
+        self
+    }
+
+    /// The label of the settings in force: the latest
+    /// [`reconfigure`](Floodwall::reconfigure)'s, or the one given to
+    /// [`Floodwall::with_settings_label`], if any.
+    pub fn settings_label(&self) -> Option<&str> {
+        self.settings_label.as_deref()
     }
 
     /// The keyring in use, if signatures are required.
@@ -947,13 +973,15 @@ impl Floodwall {
     ///
     /// # Panics
     ///
-    /// Panics if `ledger` already has records, or this plane has already
-    /// recorded something: a ledger is one plane's history from the start.
-    /// To carry on from a ledger that has records, use
-    /// [`Floodwall::resume`].
+    /// Panics if `ledger` already has records (before a checkpoint it
+    /// starts at, too), or this plane has already recorded something: a
+    /// ledger is one plane's history from the start. To carry on from a
+    /// ledger that has
+    /// records, use [`Floodwall::resume`], or, from a snapshot,
+    /// [`Floodwall::resume_from_snapshot`].
     pub fn with_ledger(mut self, mut ledger: Ledger) -> Self {
         assert!(
-            ledger.is_empty() && self.ledger.is_empty(),
+            ledger.size() == 0 && self.ledger.size() == 0,
             "with_ledger needs an empty ledger and a plane that has not recorded anything; \
              use Floodwall::resume to carry on from a ledger with records"
         );

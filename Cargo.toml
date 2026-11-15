@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["devops", "control-plane", "agents", "admission-control", "policy"]
 categories = ["concurrency", "command-line-utilities"]
 
+[workspace]
+members = ["wasm"]
+
 [dependencies]
 
 [dev-dependencies]
@@ -20,3 +23,10 @@ unsafe_code = "forbid"
 [[bin]]
 name = "floodwall"
 path = "src/bin/floodwall.rs"
+
+[profile.release]
+# The plane runs as WebAssembly in Floodwall Cloud: a panic there ends the
+# instance, which the Durable Object rebuilds from its ledger.
+panic = "abort"
+opt-level = "s"
+lto = true

@@ -16,7 +16,9 @@
 //! record the ledger holds, digest for digest. The result is the plane as
 //! it was: the queue in order, each agent's rate-limit bucket, what is in
 //! flight and since when, each resource's conflict claims, what is held and
-//! why, which held intents were released and by whom, and the clock.
+//! why, which held intents were released and by whom, and the clock. To
+//! wake a plane without replaying its whole ledger, resume it from a
+//! [snapshot](crate::snapshot) and the records after it.
 //!
 //! ```
 //! use floodwall::{Admission, Floodwall, Gate, Ledger, RateLimit};
@@ -161,6 +163,7 @@ use std::fmt;
 use crate::intent::{Intent, IntentKey};
 use crate::keyring::Keyring;
 use crate::ledger::{Digest, Ledger, Record, SignatureError, SignatureProblem};
+use crate::reconfigure::{Settings, PLANE_AGENT, RECONFIGURED};
 use crate::rules::BundleId;
 use crate::{Floodwall, Outcome, LAPSED, QUEUED, SIGNATURE_CHECK};
 
@@ -170,6 +173,14 @@ pub enum ResumeError {
     /// The plane has already queued or recorded something. Resume a plane
     /// that is newly built.
     NotFresh,
+    /// The ledger starts at a checkpoint, not at genesis
+    /// ([`Ledger::starting_at`]): resume from it with the snapshot taken at
+    /// that checkpoint ([`Floodwall::resume_from_snapshot`]).
+    NotFromGenesis,
+    /// The snapshot cannot be resumed from: the ledger does not start at its
+    /// checkpoint, the settings it names were not given, or this plane
+    /// cannot hold what it holds (see [`crate::snapshot`]).
+    Snapshot(String),
     /// The ledger does not verify ([`Ledger::verify`]).
     Unverified,
     /// The plane has a keyring, and this record's intent is not signed by
@@ -203,6 +214,10 @@ impl fmt::Display for ResumeError {
             ResumeError::NotFresh => f.write_str(
                 "the plane has already queued or recorded something; resume a newly built plane",
             ),
+            ResumeError::NotFromGenesis => f.write_str(
+                "the ledger starts at a checkpoint; resume from it with the snapshot taken there",
+            ),
+            ResumeError::Snapshot(why) => write!(f, "cannot resume from the snapshot: {why}"),
             ResumeError::Unverified => f.write_str("the ledger does not verify"),
             ResumeError::Unauthenticated(e) => {
                 write!(f, "the ledger's history is not authenticated: {e}")
@@ -229,9 +244,9 @@ impl std::error::Error for ResumeError {}
 /// `keyring` holds for it, current or retired. Each intent is checked once,
 /// however many records carry it. Records not about an intent are left to
 /// the replay, which refuses them.
-fn authenticate(ledger: &Ledger, keyring: &Keyring) -> Result<(), ResumeError> {
+pub(crate) fn authenticate(records: &[Record], keyring: &Keyring) -> Result<(), ResumeError> {
     let mut checked: HashSet<(Digest, [u8; 64])> = HashSet::new();
-    for r in ledger.records() {
+    for r in records {
         let Some(intent) = &r.intent else { continue };
         let fail = |problem| {
             Err(ResumeError::Unauthenticated(SignatureError {
@@ -347,6 +362,7 @@ enum Call {
     Release(IntentKey, String),
     Expire(IntentKey, String),
     Complete(IntentKey, Outcome),
+    Reconfigure(String),
 }
 
 impl Floodwall {
@@ -391,28 +407,79 @@ impl Floodwall {
     ///
     /// Panics if finishing a call needs to write to a ledger on disk and the
     /// write fails (see [Durability](Floodwall#durability)).
-    pub fn resume(mut self, mut ledger: Ledger, now: u64) -> Result<Floodwall, ResumeError> {
-        if !self.ledger.is_empty() || !self.admission.is_empty() || !self.live.is_empty() {
-            return Err(ResumeError::NotFresh);
+    pub fn resume(self, ledger: Ledger, now: u64) -> Result<Floodwall, ResumeError> {
+        self.resume_with(ledger, now, |_| None)
+    }
+
+    /// Like [`Floodwall::resume`], for a ledger that records changes of
+    /// settings (see [`crate::reconfigure`]): at each `reconfigured` record,
+    /// `settings` is asked for the settings its label names, and the replay
+    /// applies them as the live plane did. A label it returns `None` for is
+    /// refused as [`ResumeError::Unreplayable`]. Build this plane with the
+    /// settings the ledger started under.
+    pub fn resume_with(
+        mut self,
+        ledger: Ledger,
+        now: u64,
+        settings: impl FnMut(&str) -> Option<Settings>,
+    ) -> Result<Floodwall, ResumeError> {
+        self.check_fresh()?;
+        if ledger.size() != ledger.len() as u64 {
+            return Err(ResumeError::NotFromGenesis);
         }
         if !ledger.verify() {
             return Err(ResumeError::Unverified);
         }
         if let Some(keyring) = &self.keyring {
-            authenticate(&ledger, keyring)?;
+            authenticate(ledger.records(), keyring)?;
         }
         // Replay into a ledger of our own, then compare.
         self.ledger = Ledger::new();
+        self.catch_up(ledger, now, settings)
+    }
+
+    /// Fail with [`ResumeError::NotFresh`] unless the plane is newly built.
+    pub(crate) fn check_fresh(&self) -> Result<(), ResumeError> {
+        if self.ledger.size() != 0 || !self.admission.is_empty() || !self.live.is_empty() {
+            return Err(ResumeError::NotFresh);
+        }
+        Ok(())
+    }
+
+    /// Replay every record `ledger` holds on this plane, which is as the
+    /// plane that wrote them was just before the first, recording into a
+    /// ledger of its own that ends where that plane's did; finish a call
+    /// `ledger` ends partway through; then keep recording in `ledger`, at
+    /// tick `now`. `ledger` has been verified and, with a keyring,
+    /// authenticated.
+    pub(crate) fn catch_up(
+        mut self,
+        mut ledger: Ledger,
+        now: u64,
+        mut settings: impl FnMut(&str) -> Option<Settings>,
+    ) -> Result<Floodwall, ResumeError> {
+        debug_assert_eq!(
+            self.ledger.head(),
+            ledger.records().first().map_or(ledger.head(), |r| r.prev)
+        );
         let stored = ledger.records();
         let mut next = 0;
         while let Some(record) = stored.get(next) {
             let call = self.call_for(record)?;
+            if let Call::Reconfigure(label) = &call {
+                if settings(label).is_none() {
+                    return Err(ResumeError::Unreplayable {
+                        seq: record.seq,
+                        why: format!("no settings were given for {label:?}"),
+                    });
+                }
+            }
             if matches!(call, Call::Tick) {
                 self.replayed_checks = Some(checks_at(&stored[next..], record.tick));
                 self.replayed_bundles = Some(bundles_at(&stored[next..], record.tick));
             }
             let written = self.ledger.len();
-            let refused = self.replay(call, record.tick);
+            let refused = self.replay(call, record.tick, &mut settings);
             self.replayed_checks = None;
             self.replayed_bundles = None;
             let replayed = &self.ledger.records()[written..];
@@ -479,6 +546,11 @@ impl Floodwall {
             why: why.into(),
         };
         let Some(intent) = &record.intent else {
+            if record.verdict == RECONFIGURED && record.agent == PLANE_AGENT {
+                if let Some(label) = &record.evidence.reason {
+                    return Ok(Call::Reconfigure(label.clone()));
+                }
+            }
             return Err(unreplayable(
                 "it is not about an intent, so no plane wrote it",
             ));
@@ -521,7 +593,12 @@ impl Floodwall {
 
     /// Make `call` at tick `now`. Returns why the plane refused it, if it
     /// did.
-    fn replay(&mut self, call: Call, now: u64) -> Option<String> {
+    fn replay(
+        &mut self,
+        call: Call,
+        now: u64,
+        settings: &mut impl FnMut(&str) -> Option<Settings>,
+    ) -> Option<String> {
         match call {
             Call::Submit(intent) => {
                 let now = self.advance(now);
@@ -540,6 +617,13 @@ impl Floodwall {
                 .complete(&key, outcome, now)
                 .err()
                 .map(|e| e.to_string()),
+            Call::Reconfigure(label) => match settings(&label) {
+                Some(new) => self
+                    .reconfigure(new, &label, now)
+                    .err()
+                    .map(|e| e.to_string()),
+                None => Some(format!("no settings were given for {label:?}")),
+            },
         }
     }
 }
