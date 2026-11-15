@@ -72,7 +72,7 @@ export class Floodwall {
     Object.defineProperty(this, "apiKey", { value: options.apiKey, enumerable: false, writable: true, configurable: true });
     this.plane = options.plane;
     this.agent = options.agent;
-    this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.baseUrl = withoutTrailingSlashes(options.baseUrl ?? DEFAULT_BASE_URL);
     checkBaseUrl(this.baseUrl);
     this.whenUnreachable = options.whenUnreachable ?? "closed";
     if (this.whenUnreachable !== "closed" && this.whenUnreachable !== "open") {
@@ -263,6 +263,13 @@ export class Floodwall {
     }
     return parsed;
   }
+}
+
+/** The URL with any slashes at its end taken off; a loop, so no input makes it slow. */
+function withoutTrailingSlashes(url) {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 47) end--;
+  return url.slice(0, end);
 }
 
 function enc(value) {

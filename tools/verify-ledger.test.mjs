@@ -488,7 +488,9 @@ test("a line must be written exactly as floodwall writes it", () => {
 
 test("malformed files are refused", () => {
   fails(whole.slice(0, -1), null, /not terminated/);
-  fails(whole.replace("\n", "\r\n"), null, /\\n line endings/);
+  // Only the first line ends in \r\n: one bad line ending is enough to be refused.
+  const first = whole.indexOf("\n");
+  fails(`${whole.slice(0, first)}\r\n${whole.slice(first + 1)}`, null, /\\n line endings/);
   fails(edit(whole, 0, (o) => (o.version = 2)), null, /unsupported format/);
   fails(edit(whole, 0, (o) => (o.record_encoding = "floodwall/ledger/record/v1")), null, /unsupported encoding/);
   fails(edit(whole, 0, (o) => (o.intent_encoding = "floodwall/intent/v0")), null, /unsupported encoding/);
