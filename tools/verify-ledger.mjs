@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Verify a floodwall ledger export with nothing but Node's standard library.
 //
-//   node tools/verify-ledger.mjs LEDGER.jsonl [KEYS.json]
+//   node tools/verify-ledger.mjs [--allow-uncovered-tail] LEDGER.jsonl [KEYS.json]
 //
 // This is an independent implementation of the formats documented in the
 // crate (src/export.rs, and the encodings in src/ledger.rs, src/intent.rs,
@@ -25,7 +25,20 @@
 //   - with KEYS.json ({"plane": hex|null, "agents": {name: hex},
 //     "retired": {name: [hex, ...]}}, "retired" optional): every checkpoint
 //     is signed by the plane's key, and every record holds an intent signed
-//     by its agent's current or a retired key.
+//     by its agent's current or a retired key;
+//   - with a plane key: every record is covered by a checkpoint signed by
+//     the plane, so the export ends with one. Record digests are plain
+//     SHA-256, which anyone can recompute, and an agent's signature covers
+//     only its intent, so only the plane's signed checkpoints vouch for the
+//     verdicts: without this, whoever holds the export could remove its
+//     checkpoints and rewrite the records they covered. A ledger still
+//     being written has records after its last checkpoint; to check one,
+//     pass --allow-uncovered-tail, and the summary says how many records
+//     no signed checkpoint covers.
+// Coverage is not completeness: an export cut short at an earlier signed
+// checkpoint still verifies. To know nothing was left off the end, compare
+// the head and size printed with a checkpoint you got from the plane
+// another way.
 // A suffix export (header "from" > 0) starts from the checkpoint on its
 // second line, which the auditor trusts; it must be there, and signed when
 // a plane key is given.
@@ -344,7 +357,8 @@ export function loadKeys(keys) {
  * Error whose message starts with the 1-based line number of the first
  * problem.
  */
-export function verifyLedger(text, keys = null) {
+export function verifyLedger(text, keys = null, options = {}) {
+  const { allowUncoveredTail = false } = options ?? {};
   const keyring = keys === null ? null : loadKeys(keys);
   if (text.includes("\r")) throw new Error("line 1: the export must use \\n line endings");
   const lines = text.split("\n");
@@ -459,13 +473,25 @@ export function verifyLedger(text, keys = null) {
     }
   });
   if (!anchored) throw new Error(`line ${lines.length + 1}: the export ends before the checkpoint at ${from} it starts from`);
-  return { from, records, checkpoints, signatures, head: prev, size: seq, bundles: [...bundles.values()] };
+  // The records the plane's signed checkpoints vouch for: up to the last
+  // checkpoint (in a suffix export, the trusted one at least).
+  const covered = lastCheckpoint ?? 0;
+  if (keyring?.plane && covered < seq && !allowUncoveredTail) {
+    const what = covered === 0 ? `none of its ${seq} records is covered` : `records ${covered}..${seq} are not covered`;
+    throw new Error(
+      `line ${lines.length + 1}: ${what} by a checkpoint signed by the plane, so they could have been rewritten (or the checkpoints removed); export after cutting a checkpoint, or pass --allow-uncovered-tail to check a ledger still being written`,
+    );
+  }
+  return { from, records, checkpoints, signatures, head: prev, size: seq, covered, bundles: [...bundles.values()] };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  const args = process.argv.slice(2);
-  if (args.length < 1 || args.length > 2) {
-    console.error("usage: node tools/verify-ledger.mjs LEDGER.jsonl [KEYS.json]");
+  const flag = "--allow-uncovered-tail";
+  const all = process.argv.slice(2);
+  const allowUncoveredTail = all.includes(flag);
+  const args = all.filter((a) => a !== flag);
+  if (args.length < 1 || args.length > 2 || args.some((a) => a.startsWith("-"))) {
+    console.error(`usage: node tools/verify-ledger.mjs [${flag}] LEDGER.jsonl [KEYS.json]`);
     process.exit(2);
   }
   const [ledgerPath, keysPath] = args;
@@ -482,10 +508,17 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     }
   }
   try {
-    const s = verifyLedger(readText(ledgerPath), keys);
+    const s = verifyLedger(readText(ledgerPath), keys, { allowUncoveredTail });
     const scope = s.from > 0 ? `records ${s.from}..${s.size}, from the checkpoint at ${s.from}` : `${s.size} records from genesis`;
     console.log(`ok: ${scope}; ${s.checkpoints} checkpoints; head ${s.head}`);
-    if (keys) console.log(`ok: ${s.signatures} agent signatures${keys.plane ? " and every checkpoint signature" : ""} verified`);
+    if (keys) console.log(`ok: ${s.signatures} agent signatures${keys.plane && s.checkpoints > 0 ? " and every checkpoint signature" : ""} verified`);
+    if (keys?.plane) {
+      if (s.covered === s.size) console.log("ok: every record is covered by a checkpoint signed by the plane");
+      else if (s.covered === 0) console.log(`WARNING: no checkpoint signed by the plane covers any of the ${s.size} records`);
+      else console.log(`WARNING: ${s.size - s.covered} records after the last signed checkpoint (at ${s.covered}) are covered by no plane signature`);
+    } else if (allowUncoveredTail) {
+      console.log("note: no plane key, so coverage by signed checkpoints was not checked");
+    }
     for (const b of s.bundles) {
       console.log(`ok: bundle ${JSON.stringify(b.name)} revision ${JSON.stringify(b.revision)} (sha256 ${b.digest}) on ${b.records} records`);
     }
