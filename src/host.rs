@@ -52,6 +52,10 @@
 //!   the stats in Prometheus text.
 //! - `dry_run`: `settings`, `intents`. Each intent's gate decision under
 //!   those settings; needs no open plane and changes nothing.
+//! - `normalize_settings`: `settings`. The same settings with every default
+//!   written out (`settings`, an object), so settings stored in that form
+//!   mean the same to a later release whose defaults differ. Needs no open
+//!   plane; the answer is accepted back as it is.
 //! - `keys`: the keys auditors check the ledger with (see
 //!   [`keys_json`](crate::export::keys_json)).
 //! - `verify`: whether the ledger verifies, and how many checkpoints carry
@@ -273,6 +277,13 @@ impl Host {
                     out.push('}');
                 }
                 out.push(']');
+                Ok(out)
+            }
+            "normalize_settings" => {
+                let value = get(request, "settings")?;
+                let settings = read_settings(value)?;
+                let mut out = String::from(",\"settings\":");
+                normalized_settings(&mut out, value, &settings);
                 Ok(out)
             }
             "keys" => {
@@ -684,6 +695,84 @@ fn read_settings(value: &Value) -> Result<Settings, Refusal> {
     })
 }
 
+/// `value` (settings [`read_settings`] took as `settings`) with every
+/// default written out, keys in order.
+fn normalized_settings(out: &mut String, value: &Value, settings: &Settings) {
+    let field = |name: &str| match value {
+        Value::Object(fields) => fields.iter().find(|(k, _)| k == name).map(|(_, v)| v),
+        _ => None,
+    };
+    let number = |name: &str, default: u64| match field(name) {
+        Some(Value::Number(n)) => *n,
+        _ => default,
+    };
+    out.push_str("{\"aging\":");
+    match settings.scheduler.aging() {
+        Some(aging) => {
+            out.push_str(&format!("{{\"every\":{},\"up_to\":", aging.every()));
+            json_str(out, priority_label(aging.up_to()));
+            out.push('}');
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(&format!(
+        ",\"burst\":{},\"conflict_window\":{},\"default_limit\":{},\"hold_capacity\":{},\"hold_ttl\":",
+        number("burst", 8),
+        settings.scheduler.conflict_window(),
+        settings.scheduler.default_limit(),
+        settings.hold.capacity(),
+    ));
+    match settings.hold.ttl() {
+        Some(ttl) => out.push_str(&ttl.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"lease\":");
+    match settings.scheduler.lease() {
+        Some(Lease::Report(ticks)) => {
+            out.push_str(&format!("{{\"kind\":\"report\",\"ticks\":{ticks}}}"))
+        }
+        Some(Lease::Fail(ticks)) => {
+            out.push_str(&format!("{{\"kind\":\"fail\",\"ticks\":{ticks}}}"))
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"limits\":{");
+    // Later keys win, as in read_settings.
+    let mut limits: BTreeMap<&str, u64> = BTreeMap::new();
+    if let Some(Value::Object(given)) = field("limits") {
+        for (resource, n) in given {
+            if let Value::Number(n) = n {
+                limits.insert(resource.as_str(), *n);
+            }
+        }
+    }
+    for (i, (resource, n)) in limits.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(out, resource);
+        out.push_str(&format!(":{n}"));
+    }
+    out.push_str(&format!(
+        "}},\"refill_millis\":{},\"rules\":",
+        number("refill_millis", 1000)
+    ));
+    match field("rules") {
+        Some(Value::String(rules)) => json_str(out, rules),
+        _ => out.push_str("\"\""),
+    }
+    out.push('}');
+}
+
+fn priority_label(p: Priority) -> &'static str {
+    match p {
+        Priority::Bulk => "bulk",
+        Priority::Normal => "normal",
+        Priority::Urgent => "urgent",
+        Priority::Pager => "pager",
+    }
+}
+
 fn priority(s: &str) -> Result<Priority, Refusal> {
     Ok(match s {
         "bulk" => Priority::Bulk,
@@ -848,6 +937,29 @@ mod tests {
         assert_eq!(x, y, "{request}");
         assert_eq!(field(&x, &["ok"]), Value::Bool(true), "{x}");
         x
+    }
+
+    #[test]
+    fn normalize_settings_writes_every_default_and_takes_its_answer_back() {
+        let mut host = Host::new();
+        let answer =
+            host.handle(r#"{"op":"normalize_settings","settings":{"limits":{"web":2},"burst":3}}"#);
+        let v = json::parse(&answer).unwrap();
+        let Ok(settings) = get(&v, "settings") else {
+            panic!("no settings in {answer}")
+        };
+        let mut text = String::new();
+        normalized_settings(&mut text, settings, &read_settings(settings).ok().unwrap());
+        assert_eq!(
+            text,
+            r#"{"aging":null,"burst":3,"conflict_window":0,"default_limit":1,"hold_capacity":1024,"hold_ttl":null,"lease":null,"limits":{"web":2},"refill_millis":1000,"rules":""}"#
+        );
+        let again = host.handle(&format!(
+            r#"{{"op":"normalize_settings","settings":{text}}}"#
+        ));
+        assert_eq!(again, format!(r#"{{"ok":true,"settings":{text}}}"#));
+        let bad = host.handle(r#"{"op":"normalize_settings","settings":{"burst":"lots"}}"#);
+        assert!(bad.starts_with(r#"{"ok":false"#), "{bad}");
     }
 
     #[test]
