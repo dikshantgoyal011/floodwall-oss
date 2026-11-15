@@ -161,6 +161,7 @@ use std::fmt;
 use crate::intent::{Intent, IntentKey};
 use crate::keyring::Keyring;
 use crate::ledger::{Digest, Ledger, Record, SignatureError, SignatureProblem};
+use crate::reconfigure::{Settings, PLANE_AGENT, RECONFIGURED};
 use crate::rules::BundleId;
 use crate::{Floodwall, Outcome, LAPSED, QUEUED, SIGNATURE_CHECK};
 
@@ -347,6 +348,7 @@ enum Call {
     Release(IntentKey, String),
     Expire(IntentKey, String),
     Complete(IntentKey, Outcome),
+    Reconfigure(String),
 }
 
 impl Floodwall {
@@ -391,7 +393,22 @@ impl Floodwall {
     ///
     /// Panics if finishing a call needs to write to a ledger on disk and the
     /// write fails (see [Durability](Floodwall#durability)).
-    pub fn resume(mut self, mut ledger: Ledger, now: u64) -> Result<Floodwall, ResumeError> {
+    pub fn resume(self, ledger: Ledger, now: u64) -> Result<Floodwall, ResumeError> {
+        self.resume_with(ledger, now, |_| None)
+    }
+
+    /// Like [`Floodwall::resume`], for a ledger that records changes of
+    /// settings (see [`crate::reconfigure`]): at each `reconfigured` record,
+    /// `settings` is asked for the settings its label names, and the replay
+    /// applies them as the live plane did. A label it returns `None` for is
+    /// refused as [`ResumeError::Unreplayable`]. Build this plane with the
+    /// settings the ledger started under.
+    pub fn resume_with(
+        mut self,
+        mut ledger: Ledger,
+        now: u64,
+        mut settings: impl FnMut(&str) -> Option<Settings>,
+    ) -> Result<Floodwall, ResumeError> {
         if !self.ledger.is_empty() || !self.admission.is_empty() || !self.live.is_empty() {
             return Err(ResumeError::NotFresh);
         }
@@ -407,12 +424,20 @@ impl Floodwall {
         let mut next = 0;
         while let Some(record) = stored.get(next) {
             let call = self.call_for(record)?;
+            if let Call::Reconfigure(label) = &call {
+                if settings(label).is_none() {
+                    return Err(ResumeError::Unreplayable {
+                        seq: record.seq,
+                        why: format!("no settings were given for {label:?}"),
+                    });
+                }
+            }
             if matches!(call, Call::Tick) {
                 self.replayed_checks = Some(checks_at(&stored[next..], record.tick));
                 self.replayed_bundles = Some(bundles_at(&stored[next..], record.tick));
             }
             let written = self.ledger.len();
-            let refused = self.replay(call, record.tick);
+            let refused = self.replay(call, record.tick, &mut settings);
             self.replayed_checks = None;
             self.replayed_bundles = None;
             let replayed = &self.ledger.records()[written..];
@@ -479,6 +504,11 @@ impl Floodwall {
             why: why.into(),
         };
         let Some(intent) = &record.intent else {
+            if record.verdict == RECONFIGURED && record.agent == PLANE_AGENT {
+                if let Some(label) = &record.evidence.reason {
+                    return Ok(Call::Reconfigure(label.clone()));
+                }
+            }
             return Err(unreplayable(
                 "it is not about an intent, so no plane wrote it",
             ));
@@ -521,7 +551,12 @@ impl Floodwall {
 
     /// Make `call` at tick `now`. Returns why the plane refused it, if it
     /// did.
-    fn replay(&mut self, call: Call, now: u64) -> Option<String> {
+    fn replay(
+        &mut self,
+        call: Call,
+        now: u64,
+        settings: &mut impl FnMut(&str) -> Option<Settings>,
+    ) -> Option<String> {
         match call {
             Call::Submit(intent) => {
                 let now = self.advance(now);
@@ -540,6 +575,13 @@ impl Floodwall {
                 .complete(&key, outcome, now)
                 .err()
                 .map(|e| e.to_string()),
+            Call::Reconfigure(label) => match settings(&label) {
+                Some(new) => self
+                    .reconfigure(new, &label, now)
+                    .err()
+                    .map(|e| e.to_string()),
+                None => Some(format!("no settings were given for {label:?}")),
+            },
         }
     }
 }

@@ -101,7 +101,7 @@ pub const VERSION: u64 = 1;
 
 /// Write `s` as a JSON string: quotes and backslashes escaped, control
 /// characters as escapes, everything else as UTF-8.
-fn json_str(out: &mut String, s: &str) {
+pub(crate) fn json_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -134,7 +134,7 @@ pub(crate) fn header(from: u64) -> String {
     )
 }
 
-fn intent_json(s: &mut String, i: &Intent) {
+pub(crate) fn intent_json(s: &mut String, i: &Intent) {
     s.push_str(&format!("{{\"id\":\"{}\",\"agent\":", i.id));
     json_str(s, i.agent.as_str());
     s.push_str(",\"action\":{\"kind\":");
@@ -440,7 +440,7 @@ fn number(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// A `u64` written as a decimal string, the way `intent_id` is.
-fn decimal(value: &Value, what: &str) -> Result<u64, String> {
+pub(crate) fn decimal(value: &Value, what: &str) -> Result<u64, String> {
     let s = string(value, what)?;
     let canonical = s == "0" || (!s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()));
     match s.parse::<u64>() {
@@ -450,7 +450,7 @@ fn decimal(value: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// `N` bytes written as lowercase hex.
-fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
+pub(crate) fn hex<const N: usize>(value: &Value, what: &str) -> Result<[u8; N], String> {
     let s = string(value, what)?;
     let digit = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -514,7 +514,7 @@ fn read_header(value: &Value) -> Result<u64, String> {
     Ok(from)
 }
 
-fn read_intent(value: &Value) -> Result<Intent, String> {
+pub(crate) fn read_intent(value: &Value) -> Result<Intent, String> {
     let f = fields(
         value,
         &[

@@ -248,6 +248,17 @@ impl Admission {
         }
     }
 
+    /// Change every agent's rate limit from now on (see
+    /// [`crate::reconfigure`]). Each agent keeps the tokens it has saved,
+    /// up to the new burst. The caller has validated `limit`.
+    pub(crate) fn set_rate_limit(&mut self, limit: RateLimit) {
+        debug_assert!(limit.validate().is_ok());
+        for bucket in self.buckets.values_mut() {
+            bucket.tokens = bucket.tokens.min(limit.burst);
+        }
+        self.limit = limit;
+    }
+
     /// Advance the clock to `now` and return the effective time: `now`, or
     /// the clock if `now` is earlier. Every time-taking method calls this
     /// before touching any other state.
