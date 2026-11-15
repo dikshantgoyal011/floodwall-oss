@@ -1,0 +1,50 @@
+# A GitHub Actions workflow that asks a Floodwall plane before it deploys.
+#
+# Copy it to .github/workflows/deploy.yml in your repository, with
+# sdk/examples/ci-gate.mjs (or install @floodwall/client and change its import),
+# and add two secrets: FLOODWALL_KEY (an agent key, bound to the agent
+# "github-actions") and FLOODWALL_PLANE (the plane's id).
+#
+# The gate step fails the job if the plane doesn't admit the deploy: rejected,
+# or still held for a person after ten minutes. Once a person releases a held
+# deploy, re-run the job. The report step always tells the plane how the
+# deploy went, so the next deploy to the resource can start.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency: deploy-${{ github.ref }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FLOODWALL_KEY: ${{ secrets.FLOODWALL_KEY }}
+      FLOODWALL_PLANE: ${{ secrets.FLOODWALL_PLANE }}
+      FLOODWALL_AGENT: github-actions
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Ask Floodwall
+        id: gate
+        run: node sdk/examples/ci-gate.mjs ask --resource api --manifest "${{ github.sha }}" --blast service --timeout 600
+
+      - name: Deploy
+        id: deploy
+        # Replace with your deploy. It runs only if the gate admitted it.
+        run: echo "deploying api at ${{ github.sha }}"
+
+      - name: Report to Floodwall
+        if: always() && steps.gate.outputs.intent_id != ''
+        run: >
+          node sdk/examples/ci-gate.mjs report
+          --id "${{ steps.gate.outputs.intent_id }}"
+          --outcome "${{ steps.deploy.outcome == 'success' && 'succeeded' || 'failed' }}"
+          --reason "deploy step: ${{ steps.deploy.outcome }}"
