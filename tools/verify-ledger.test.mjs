@@ -300,9 +300,20 @@ test("with the plane's key, every record must be covered by a signed checkpoint"
   r = cli(whole, JSON.stringify(keys));
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /ok: every record is covered by a checkpoint signed by the plane/);
+  r = cli(forged, JSON.stringify(keys), ["--allow-uncovered-tail"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /WARNING: no checkpoint signed by the plane covers any of the \d+ records/);
+  assert.doesNotMatch(r.stdout, /every checkpoint signature/);
   // An unknown option is a usage error, not a ledger path.
-  r = cli(whole, JSON.stringify(keys), ["--allow-uncovered"]);
-  assert.equal(r.status, 2);
+  for (const option of ["--allow-uncovered", "-h"]) {
+    r = cli(whole, JSON.stringify(keys), [option]);
+    assert.equal(r.status, 2, option);
+  }
+  assert.doesNotThrow(() => verifyLedger(whole, keys, null));
+  // A suffix export with nothing after its trusted checkpoint is covered.
+  const bare = join_(lines(suffix).slice(0, 2));
+  const s = verifyLedger(bare, keys);
+  assert.equal(s.covered, s.size);
 });
 
 test("records are checked against the exact schema before hashing", () => {
