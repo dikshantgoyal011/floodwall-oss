@@ -43,7 +43,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   isn't set to cancel. Ledger lines in other accounts' planes stay (they are
   hash-chained audit records); billing records stay with Paygate as tax law
   requires. New routes under `/auth/account/` (api/README.md, "Account
-  controls"); migration `0014_account_controls.sql` adds the sessions'
+  controls"); migration `0015_account_controls.sql` adds the sessions'
   `last_seen_at`, `device` and `country` and the `account_codes` table.
 
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
