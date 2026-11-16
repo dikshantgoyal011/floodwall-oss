@@ -28,7 +28,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   operators in `ADMIN_EMAILS` and, with the optional `ALERT_WEBHOOK_URL` secret,
   posts to a Slack or Discord webhook. Each error signature alerts at most once
   an hour (`error_alerts`, migration `0014`), at most 30 alerts go out an hour
-  in all, and secrets, tokens, cookies, query strings and email addresses are
+  for the Worker's failures and 5 for the site's (unverified) reports, and secrets, tokens, cookies, query strings and email addresses are
   redacted before anything is stored or sent. `POST /errors` takes only the
   allowed sites, 8 KB at most, 20 reports an hour per network.
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
