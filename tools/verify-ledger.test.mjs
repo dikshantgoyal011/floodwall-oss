@@ -24,6 +24,7 @@ const suffix = read(ledgerDir, "ledger-suffix.jsonl");
 const keys = JSON.parse(read(ledgerDir, "keys.json"));
 const edge = read(fixtureDir, "edge.jsonl");
 const edgeKeys = JSON.parse(read(fixtureDir, "keys.json"));
+const reviewed = read(fixtureDir, "reviewed.jsonl");
 
 const lines = (text) => text.split("\n").slice(0, -1);
 const join_ = (ls) => ls.join("\n") + "\n";
@@ -76,6 +77,45 @@ test("the edge-case fixture verifies", () => {
   const s = verifyLedger(edge, edgeKeys);
   assert.equal(s.records, 8);
   assert.equal(verifyLedger(read(fixtureDir, "edge-suffix.jsonl"), edgeKeys).head, s.head);
+});
+
+test("a model's review is checked and covered by its record's digest", () => {
+  const s = verifyLedger(reviewed, edgeKeys);
+  assert.equal(s.records, 5);
+  assert.equal(s.signatures, 5);
+  const records = recordLines(reviewed);
+  assert.equal(records[0][1].intent.review, undefined, "an intent without a review has no field");
+  assert.deepEqual(
+    records.slice(1).map(([, o]) => o.intent.review.outcome),
+    ["clear", "defer", "skipped", "defer"],
+  );
+  // Without the review the record hashes as it would have before reviews
+  // existed: the review is item 12, after everything else.
+  const [i, r] = records[2];
+  const { review, ...bare } = r.intent;
+  assert.notEqual(recordDigest({ ...r, intent: bare }), r.digest);
+  // The agent signed the change, not the review: the signature still holds
+  // with the review removed, so only the record digest protects it.
+  assert.deepEqual(intentDigest(bare), intentDigest(r.intent));
+  for (const [what, change] of [
+    ["the model", (o) => (o.intent.review.model = "another-model")],
+    ["the prompt hash", (o) => (o.intent.review.prompt_sha256 = "0".repeat(64))],
+    ["the outcome", (o) => (o.intent.review = { ...o.intent.review, outcome: "skipped" })],
+    ["the reason", (o) => (o.intent.review.reason = "looks fine")],
+    ["a defer cleared", (o) => (o.intent.review = { model: o.intent.review.model, prompt_sha256: o.intent.review.prompt_sha256, outcome: "clear" })],
+    ["the review dropped", (o) => delete o.intent.review],
+  ]) {
+    assert.throws(() => verifyLedger(edit(reviewed, i, change), edgeKeys), /record 2 does not match its digest/, what);
+  }
+  // A review is checked against the exact schema before hashing.
+  fails(edit(reviewed, i, (o) => (o.intent.review.outcome = "admit")), edgeKeys, /intent\.review\.outcome is not one of clear, defer, skipped/);
+  fails(edit(reviewed, i, (o) => delete o.intent.review.reason), edgeKeys, /intent\.review has no "reason"/);
+  fails(edit(reviewed, i, (o) => (o.intent.review.prompt_sha256 = "AB".repeat(32))), edgeKeys, /intent\.review\.prompt_sha256 is not 32 bytes of lowercase hex/);
+  fails(edit(reviewed, i, (o) => (o.intent.review.model = 7)), edgeKeys, /intent\.review\.model is not a string/);
+  fails(edit(reviewed, i, (o) => (o.intent.review = null)), edgeKeys, /intent\.review is not a JSON object/);
+  const [j] = records[1];
+  fails(edit(reviewed, j, (o) => (o.intent.review.reason = "x")), edgeKeys, /intent\.review has an unknown field "reason"/);
+  fails(edit(reviewed, j, (o) => (o.intent = { review: o.intent.review, ...o.intent })), edgeKeys, /does not have its fields in the documented order/);
 });
 
 test("an edited record is caught, even with its own digest fixed", () => {

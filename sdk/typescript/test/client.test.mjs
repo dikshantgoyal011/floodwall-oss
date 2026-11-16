@@ -227,3 +227,30 @@ test("baseUrl must be https unless local; the key stays out of logs", () => {
   assert.ok(!Object.keys(c).includes("apiKey"));
   assert.equal(c.apiKey, "fw_test_x");
 });
+
+test("context goes in the POST body, never in the signed bytes or the intent", async () => {
+  const s = stub(async () => [200, { verdict: "admit" }]);
+  const c = client(s.fetch);
+  const change = { action: { kind: "scale", resource: "web", replicas: 2 }, context: "- replicas: 1\n+ replicas: 2" };
+  assert.ok(!("context" in c.intent(change)));
+  await c.submit(change);
+  assert.equal(s.calls[0].body.context, "- replicas: 1\n+ replicas: 2");
+  const { context, ...intent } = s.calls[0].body;
+  assert.deepEqual(intentBytes(intent), intentBytes({ ...intent, context: "other" }));
+  await c.guard({ ...change, context: "plan" }, () => "ok");
+  assert.equal(s.calls[1].body.context, "plan");
+  assert.ok(!("context" in s.calls[2].body));
+  await c.submit({ action: change.action });
+  assert.ok(!("context" in s.calls.at(-1).body));
+});
+
+test("context over 64 KiB or not a string is refused before anything is sent", async () => {
+  const s = stub(async () => [200, { verdict: "admit" }]);
+  const c = client(s.fetch);
+  const action = { kind: "scale", resource: "web", replicas: 2 };
+  await assert.rejects(c.submit({ action, context: "x".repeat(65537) }), TypeError);
+  await assert.rejects(c.guard({ action, context: "é".repeat(40000) }, () => assert.fail("applied")), TypeError);
+  await assert.rejects(c.submit({ action, context: 5 }), TypeError);
+  await c.submit({ action, context: "x".repeat(65536) });
+  assert.equal(s.calls.length, 1);
+});

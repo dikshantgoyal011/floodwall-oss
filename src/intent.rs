@@ -157,6 +157,10 @@ pub enum Priority {
 ///    `Global` 3.
 ///
 /// The signature is Ed25519 over the 32 digest bytes.
+///
+/// The [`review`](Intent::review) is not part of the digest: the agent signs
+/// the change it asks for, and the plane attaches a model's review of it
+/// afterwards (see [`Review`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     /// Author-assigned id, monotonic per agent. A plane with a keyring
@@ -174,6 +178,60 @@ pub struct Intent {
     pub blast_radius: BlastRadius,
     /// The agent's signature of the intent's digest, if it signed it.
     pub signature: Option<Signature>,
+    /// A model's review of the change, attached by the plane before the
+    /// intent reaches the gate, if it was reviewed. Not covered by the
+    /// intent's digest or signature; covered by the digest of every ledger
+    /// record about the intent (see [Record encoding](crate::ledger#record-encoding)).
+    pub review: Option<Review>,
+}
+
+/// A model's review of an intent, recorded so that replay reads it and
+/// never asks a model again.
+///
+/// The gate turns it into one more entry in its breakdown, `ai-review`
+/// (see [`Gate::evaluate`](crate::gate::Gate::evaluate)): a review can only
+/// make the wall stricter. It may defer a change, never admit one another
+/// policy deferred or rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Review {
+    /// The model that reviewed the change, e.g. `claude-opus-5-5`.
+    pub model: String,
+    /// SHA-256 of the exact prompt sent to the model, as 64 lowercase hex
+    /// digits.
+    pub prompt_sha256: String,
+    /// What the review concluded.
+    pub outcome: ReviewOutcome,
+}
+
+/// What a model's review of an intent concluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// The model saw nothing to hold the change for.
+    Clear,
+    /// The model asks a human to look first, for the reason given.
+    Defer(String),
+    /// The review did not happen (a timeout, an error, a spent budget), for
+    /// the reason given; the rules alone decide.
+    Skipped(String),
+}
+
+impl ReviewOutcome {
+    /// A short, stable label: `clear`, `defer` or `skipped`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReviewOutcome::Clear => "clear",
+            ReviewOutcome::Defer(_) => "defer",
+            ReviewOutcome::Skipped(_) => "skipped",
+        }
+    }
+
+    /// The reason, for a `Defer` or `Skipped`.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            ReviewOutcome::Clear => None,
+            ReviewOutcome::Defer(reason) | ReviewOutcome::Skipped(reason) => Some(reason),
+        }
+    }
 }
 
 impl Intent {
@@ -192,7 +250,15 @@ impl Intent {
             priority,
             blast_radius,
             signature: None,
+            review: None,
         }
+    }
+
+    /// This intent with `review` attached. Builder style. The review is not
+    /// part of the intent's digest, so a signature stays valid.
+    pub fn with_review(mut self, review: Review) -> Self {
+        self.review = Some(review);
+        self
     }
 
     /// This intent's identity. Ids are only unique per agent, so an intent
@@ -422,6 +488,15 @@ mod tests {
         );
         // The signature is not part of the digest.
         assert_eq!(signed.digest(), deploy().digest());
+        // Nor is a review: the plane attaches it after the agent signed.
+        let key = SigningKey::from_seed(&[7; 32]);
+        let reviewed = signed.with_review(Review {
+            model: "m".into(),
+            prompt_sha256: "0".repeat(64),
+            outcome: ReviewOutcome::Defer("why".into()),
+        });
+        assert_eq!(reviewed.digest(), deploy().digest());
+        assert!(reviewed.is_signed_by(&key.verifying_key()));
     }
 
     #[test]

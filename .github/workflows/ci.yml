@@ -112,6 +112,11 @@ jobs:
           node-version: 22
       - name: typescript client
         run: npm --prefix sdk/typescript test
+      # @floodwall/mcp depends on the published client (^0.2.0); CI tests it
+      # against the client in this checkout instead, so no lockfile is kept.
+      - name: mcp server and agent hooks
+        working-directory: sdk/mcp
+        run: npm install --ignore-scripts --no-package-lock --no-save ../typescript && npm test
       - name: python client
         working-directory: sdk/python
         run: python3 -m unittest discover -s tests -t .

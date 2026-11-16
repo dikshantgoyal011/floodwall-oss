@@ -49,6 +49,11 @@ rejected, expires or lapses. Rate limits (HTTP 429) are waited out.
   `[::1]`. `apiKey` is not enumerable, so logging the client does not print it.
 - `signingKey` (an Ed25519 `CryptoKey` or 32-byte seed) signs each intent,
   for planes whose keyring requires it.
+- Since 0.2.0, `context` on a change (a string up to 64 KiB, such as a diff or plan) goes
+  to the plane as a top-level field, for its AI review of the change. It is
+  never part of the signed intent bytes and the plane does not store it.
+  Longer or non-string context throws a `TypeError` before anything is sent.
+  `submit({ action, context })` and `guard({ action, context }, apply)` both take it.
 - Intent ids default to the time in microseconds, kept increasing, so an
   agent that restarts needs no saved state.
 

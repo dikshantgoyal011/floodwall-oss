@@ -43,8 +43,38 @@ rejected, expires or lapses. Rate limits (HTTP 429) are waited out.
 - `base_url` must be `https://`, except for `localhost`, `127.0.0.1` and
   `[::1]`. Redirects are never followed, and the key is not in `repr()`.
 - `Retry-After` may be seconds or an HTTP date.
+- Since 0.2.0, `context` (a string up to 64 KiB, such as a diff or plan) on a change goes
+  to the plane as a top-level field, for its AI review of the change. It is
+  never part of the signed intent bytes and the plane does not store it.
+  Longer or non-string context raises `ValueError` before anything is sent.
+- `floodwall.langgraph` wraps a tool in `guard()` for LangGraph agents; see
+  below.
 - `signing_key` signs each intent, for planes whose keyring requires it:
   `pip install floodwall[signing]`.
+
+## LangGraph
+
+`pip install floodwall[langgraph]`. Import is lazy: `floodwall` itself needs
+nothing, and only `guard_node` needs `langgraph`.
+
+```python
+from floodwall import Floodwall
+from floodwall.langgraph import guarded_tool, guard_node
+
+fw = Floodwall(api_key=os.environ["FLOODWALL_KEY"], plane="pl_...", agent="graph-agent")
+
+# A plain function that asks the plane first. A refusal comes back as a string
+# the model can read, never an exception that ends the run.
+scale = guarded_tool(
+    fw,
+    lambda deployment, replicas: run_kubectl_scale(deployment, replicas),
+    change=lambda deployment, replicas: {"action": {"kind": "scale", "resource": deployment, "replicas": replicas}},
+    name="scale_deployment",
+)
+
+# Or a graph node: reads state["proposed_change"], writes state["floodwall"].
+graph.add_node("guard", guard_node(fw, apply=lambda state: apply_change(state["proposed_change"])))
+```
 
 Tests: `python3 -m unittest discover -s tests -t .`
 

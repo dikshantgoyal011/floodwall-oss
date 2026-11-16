@@ -1,0 +1,62 @@
+{
+  "name": "@floodwall/mcp",
+  "version": "0.1.0",
+  "description": "An MCP server and agent hooks that make LLM agents ask a Floodwall plane before they change production.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./agent-sdk": {
+      "types": "./src/agent-sdk.d.ts",
+      "default": "./src/agent-sdk.js"
+    },
+    "./claude-code-hook": "./hooks/claude-code.mjs"
+  },
+  "bin": {
+    "floodwall-mcp": "src/cli.js",
+    "floodwall-claude-hook": "hooks/claude-code.mjs"
+  },
+  "files": [
+    "src",
+    "hooks",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "link-local-client": "npm install --ignore-scripts --no-package-lock --no-save ../typescript",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@floodwall/client": "^0.2.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-agent-sdk": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/claude-agent-sdk": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erphq/floodwall.git",
+    "directory": "sdk/mcp"
+  },
+  "keywords": [
+    "floodwall",
+    "mcp",
+    "agents",
+    "claude-code",
+    "devops",
+    "policy"
+  ],
+  "homepage": "https://floodwall.ai",
+  "publishConfig": {
+    "access": "public"
+  }
+}

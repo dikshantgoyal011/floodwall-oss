@@ -45,8 +45,25 @@
 //!          |{"kind":"destroy","resource":"web"},
 //!  "priority":"bulk"|"normal"|"urgent"|"pager",
 //!  "blast_radius":"cell"|"service"|"region"|"global",
-//!  "signature":"<hex>"|null}
+//!  "signature":"<hex>"|null,
+//!  "review":<review>}
 //! ```
+//!
+//! `review` is there only for an intent that carries a model's review
+//! ([`crate::Review`]), and left out otherwise, so every export written
+//! before reviews existed reads as it always did:
+//!
+//! ```text
+//! {"model":"claude-opus-5-5","prompt_sha256":"<64 hex>","outcome":"clear"}
+//! {"model":"claude-opus-5-5","prompt_sha256":"<64 hex>","outcome":"defer","reason":"..."}
+//! {"model":"claude-opus-5-5","prompt_sha256":"<64 hex>","outcome":"skipped","reason":"..."}
+//! ```
+//!
+//! `reason` is there for `defer` and `skipped`, and only for them. A record
+//! whose intent has a review covers it with item 12 of the record encoding
+//! (see [`crate::ledger`]); the header's `record_encoding` stays
+//! `floodwall/ledger/record/v4`, since a record without a review digests as
+//! it always did.
 //!
 //! A record with an intent must agree with it: the same `intent_id` (its
 //! `id`) and `agent`, and an `action` that is its action's summary:
@@ -87,7 +104,7 @@ use std::io::{self, Write};
 
 use crate::checkpoint::Checkpoint;
 use crate::ed25519::{Signature, VerifyingKey};
-use crate::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+use crate::intent::{Action, AgentId, BlastRadius, Intent, Priority, Review, ReviewOutcome};
 use crate::json::{self, Value};
 use crate::keyring::Keyring;
 use crate::ledger::{Digest, Evidence, Ledger, Record};
@@ -155,6 +172,18 @@ pub(crate) fn intent_json(s: &mut String, i: &Intent) {
         ",\"priority\":\"{priority}\",\"blast_radius\":\"{blast}\",\"signature\":"
     ));
     json_opt_str(s, i.signature.map(|sig| sig.to_string()).as_deref());
+    if let Some(review) = &i.review {
+        s.push_str(",\"review\":{\"model\":");
+        json_str(s, &review.model);
+        s.push_str(",\"prompt_sha256\":");
+        json_str(s, &review.prompt_sha256);
+        s.push_str(&format!(",\"outcome\":\"{}\"", review.outcome.label()));
+        if let Some(reason) = review.outcome.reason() {
+            s.push_str(",\"reason\":");
+            json_str(s, reason);
+        }
+        s.push('}');
+    }
     s.push('}');
 }
 
@@ -544,18 +573,17 @@ fn read_header(value: &Value) -> Result<u64, String> {
 }
 
 pub(crate) fn read_intent(value: &Value) -> Result<Intent, String> {
-    let f = fields(
-        value,
-        &[
-            "id",
-            "agent",
-            "action",
-            "priority",
-            "blast_radius",
-            "signature",
-        ],
-        "intent",
-    )?;
+    let reviewed = matches!(value, Value::Object(f) if f.iter().any(|(key, _)| key == "review"));
+    let names: &[&str] = &[
+        "id",
+        "agent",
+        "action",
+        "priority",
+        "blast_radius",
+        "signature",
+        "review",
+    ];
+    let f = fields(value, if reviewed { names } else { &names[..6] }, "intent")?;
     let action = read_action(f[2], "intent.action")?;
     let priority = match string(f[3], "intent.priority")? {
         "bulk" => Priority::Bulk,
@@ -578,6 +606,45 @@ pub(crate) fn read_intent(value: &Value) -> Result<Intent, String> {
         priority,
         blast_radius,
         signature: signature(f[5], "intent.signature")?,
+        review: match f.get(6) {
+            None => None,
+            Some(review) => Some(read_review(review)?),
+        },
+    })
+}
+
+/// An intent's review in the export's form: `reason` there exactly for the
+/// outcomes that have one.
+fn read_review(value: &Value) -> Result<Review, String> {
+    let outcome = match value {
+        Value::Object(fields) => fields
+            .iter()
+            .find(|(key, _)| key == "outcome")
+            .map(|(_, v)| string(v, "intent.review.outcome"))
+            .transpose()?,
+        _ => None,
+    };
+    let names: &[&str] = &["model", "prompt_sha256", "outcome", "reason"];
+    let with_reason = matches!(outcome, Some("defer" | "skipped"));
+    let f = fields(
+        value,
+        if with_reason { names } else { &names[..3] },
+        "intent.review",
+    )?;
+    let model = string(f[0], "intent.review.model")?.to_string();
+    let prompt_sha256 = string(f[1], "intent.review.prompt_sha256")?;
+    hex::<32>(f[1], "intent.review.prompt_sha256")?;
+    let reason = || string(f[3], "intent.review.reason").map(str::to_string);
+    let outcome = match string(f[2], "intent.review.outcome")? {
+        "clear" => ReviewOutcome::Clear,
+        "defer" => ReviewOutcome::Defer(reason()?),
+        "skipped" => ReviewOutcome::Skipped(reason()?),
+        _ => return Err("intent.review.outcome is not clear, defer or skipped".into()),
+    };
+    Ok(Review {
+        model,
+        prompt_sha256: prompt_sha256.to_string(),
+        outcome,
     })
 }
 
@@ -1097,6 +1164,115 @@ mod tests {
             read_line(&header(9)),
             Ok(Line::Header { from: 9 })
         ));
+    }
+
+    #[test]
+    fn a_review_is_written_only_when_there_is_one_and_reads_back() {
+        let plain = Intent::new(
+            1,
+            AgentId::new("bot"),
+            Action::Destroy {
+                resource: "db".into(),
+            },
+            Priority::Urgent,
+            BlastRadius::Region,
+        );
+        let review = |outcome| Review {
+            model: "mod\u{e8}le \"x\"".into(),
+            prompt_sha256: "0f".repeat(32),
+            outcome,
+        };
+        let mut l = Ledger::new();
+        l.append_intent(&plain, "admit", None, vec![]);
+        for outcome in [
+            ReviewOutcome::Clear,
+            ReviewOutcome::Defer("line 1\nline 2".into()),
+            ReviewOutcome::Skipped(String::new()),
+        ] {
+            let i = plain.clone().with_review(review(outcome));
+            l.append_intent(&i, "admit", None, vec![]);
+        }
+        let text = export(&l);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[1].contains("review"), "no review, no field");
+        let sha = "0f".repeat(32);
+        let tail = |outcome: &str| {
+            format!(
+                ",\"signature\":null,\"review\":{{\"model\":\"mod\u{e8}le \\\"x\\\"\",\"prompt_sha256\":\"{sha}\",{outcome}}}}},\"prev\""
+            )
+        };
+        assert!(
+            lines[2].contains(&tail("\"outcome\":\"clear\"")),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains(&tail(
+                "\"outcome\":\"defer\",\"reason\":\"line 1\\nline 2\""
+            )),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[4].contains(&tail("\"outcome\":\"skipped\",\"reason\":\"\"")),
+            "{}",
+            lines[4]
+        );
+        // The export reads back into the same ledger, reviews and all.
+        let back = Ledger::read_jsonl(text.as_bytes()).unwrap();
+        assert_eq!(back.head(), l.head());
+        for (a, b) in back.records().iter().zip(l.records()) {
+            assert_eq!(a.intent, b.intent);
+        }
+        assert_eq!(export(&back), text);
+
+        // A review must be exactly as written.
+        let refused = |line: String, problem: &str| match read_line(&line) {
+            Ok(read) => panic!("{line} was read as {read:?}"),
+            Err(e) => assert!(e.contains(problem), "{line}: {e:?} should say {problem:?}"),
+        };
+        let clear = lines[2];
+        let defer = lines[3];
+        refused(
+            clear.replace("\"outcome\":\"clear\"", "\"outcome\":\"admit\""),
+            "intent.review.outcome is not clear, defer or skipped",
+        );
+        refused(
+            clear.replace(
+                "\"outcome\":\"clear\"",
+                "\"outcome\":\"clear\",\"reason\":\"x\"",
+            ),
+            "intent.review has an unknown field \"reason\"",
+        );
+        refused(
+            defer.replace(",\"reason\":\"line 1\\nline 2\"", ""),
+            "intent.review has no \"reason\"",
+        );
+        refused(
+            clear.replace(&sha, &sha.to_uppercase()),
+            "intent.review.prompt_sha256 is not 32 bytes of lowercase hex",
+        );
+        refused(
+            clear.replace(&sha, "0f"),
+            "intent.review.prompt_sha256 is not 32 bytes of lowercase hex",
+        );
+        refused(
+            clear.replace("\"model\":\"mod\u{e8}le \\\"x\\\"\"", "\"model\":null"),
+            "intent.review.model is null, not a string",
+        );
+        refused(
+            clear.replace(",\"review\":{", ",\"review\":null,\"x\":{"),
+            "intent has an unknown field \"x\"",
+        );
+        refused(
+            clear
+                .replace("\"signature\":null,\"review\"", "\"review\"")
+                .replace(
+                    "\"outcome\":\"clear\"}",
+                    "\"outcome\":\"clear\"},\"signature\":null",
+                ),
+            "intent does not have its fields in the documented order",
+        );
     }
 
     #[test]

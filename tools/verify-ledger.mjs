@@ -17,6 +17,8 @@
 //   - every record is at the next position, links to the one before it,
 //     is at a tick no earlier than it, has the digest its fields give, and
 //     shows the intent it holds: the same intent id, agent and action;
+//   - a model's review an intent carries (its model, prompt hash, outcome
+//     and reason) is well formed and covered by the record's digest;
 //   - every policy bundle a record names (its name, revision, and the
 //     SHA-256 of the bundle's rules file) is well formed and covered by the
 //     record's digest;
@@ -111,8 +113,13 @@ const ACTIONS = new Map([
   ["destroy", ["kind", "resource"]],
 ]);
 
+const INTENT_FIELDS = ["id", "agent", "action", "priority", "blast_radius", "signature"];
+const OUTCOMES = ["clear", "defer", "skipped"];
+
 function checkIntent(i, what) {
-  fields(i, ["id", "agent", "action", "priority", "blast_radius", "signature"], what);
+  // "review" is there only for an intent a model reviewed (src/export.rs).
+  const reviewed = isObject(i) && Object.hasOwn(i, "review");
+  fields(i, reviewed ? [...INTENT_FIELDS, "review"] : INTENT_FIELDS, what);
   decimalU64(i.id, `${what}.id`);
   string(i.agent, `${what}.agent`);
   const a = i.action;
@@ -129,6 +136,32 @@ function checkIntent(i, what) {
   if (!PRIORITIES.includes(i.priority)) throw new Error(`${what}.priority is not one of ${PRIORITIES.join(", ")}`);
   if (!BLAST_RADII.includes(i.blast_radius)) throw new Error(`${what}.blast_radius is not one of ${BLAST_RADII.join(", ")}`);
   nullOr(hexOf(64))(i.signature, `${what}.signature`);
+  if (reviewed) checkReview(i.review, `${what}.review`);
+}
+
+// A model's review of an intent: "reason" there exactly for "defer" and
+// "skipped".
+function checkReview(v, what) {
+  if (!isObject(v)) throw new Error(`${what} is not a JSON object`);
+  if (typeof v.outcome !== "string" || !OUTCOMES.includes(v.outcome)) throw new Error(`${what}.outcome is not one of ${OUTCOMES.join(", ")}`);
+  const withReason = v.outcome !== "clear";
+  fields(v, ["model", "prompt_sha256", "outcome", ...(withReason ? ["reason"] : [])], what);
+  string(v.model, `${what}.model`);
+  unhex(v.prompt_sha256, 32, `${what}.prompt_sha256`);
+  if (withReason) string(v.reason, `${what}.reason`);
+}
+
+// Item 12 of the record encoding, only for a record whose intent has a
+// review (src/ledger.rs).
+function reviewBytes(review) {
+  if (review === undefined) return [];
+  return [
+    field("review"),
+    field(review.model),
+    field(review.prompt_sha256),
+    field(review.outcome),
+    optional(review.outcome === "clear" ? null : field(review.reason)),
+  ];
 }
 
 function checkBundle(b, what) {
@@ -262,6 +295,7 @@ export function recordDigest(r) {
       ...r.policies.flatMap(([name, label]) => [field(name), field(label)]),
       u64(r.bundles.length),
       ...r.bundles.flatMap((b) => [field(b.name), field(b.revision), unhex(b.digest, 32, "bundle digest")]),
+      ...reviewBytes(r.intent?.review),
     ),
   );
 }

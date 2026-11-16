@@ -34,7 +34,26 @@
 //! 10. the number of `evidence.policies` as a `u64`, then for each, its name
 //!     and its label as fields;
 //! 11. the number of `evidence.bundles` as a `u64`, then for each, its name
-//!     and its revision as fields, then its 32-byte digest.
+//!     and its revision as fields, then its 32-byte digest;
+//! 12. only if the record's intent carries a [review](crate::Review): the
+//!     field `review`, then its `model` and `prompt_sha256` as fields, then
+//!     its outcome as a field, `clear`, `defer` or `skipped`, then the
+//!     outcome's reason: the byte `0` if there is none (`clear`), or the
+//!     byte `1` followed by the reason as a field.
+//!
+//! Item 12 was added to the v4 encoding without changing its domain: a
+//! record whose intent has no review (every record written before reviews
+//! existed among them) has no item 12 and digests exactly as before.
+//!
+//! # AI review
+//!
+//! A model's review of an intent ([`Intent::review`]) travels with the
+//! intent, so every record about a reviewed intent (its arrival, its
+//! decision, and anything after) carries it, and item 12 puts it under the
+//! record's digest: which model reviewed the change, the hash of the exact
+//! prompt it was given, and what it concluded can be no more rewritten than
+//! the verdict. Replay reads the review from the ledger and never asks a
+//! model again (see [AI review](crate::gate#ai-review)).
 //!
 //! # Policy bundles
 //!
@@ -233,6 +252,19 @@ impl Record {
             field(&mut h, bundle.name.as_bytes());
             field(&mut h, bundle.revision.as_bytes());
             h.update(bundle.digest.as_bytes());
+        }
+        if let Some(review) = self.intent.as_ref().and_then(|i| i.review.as_ref()) {
+            field(&mut h, b"review");
+            field(&mut h, review.model.as_bytes());
+            field(&mut h, review.prompt_sha256.as_bytes());
+            field(&mut h, review.outcome.label().as_bytes());
+            match review.outcome.reason() {
+                None => h.update(&[0]),
+                Some(reason) => {
+                    h.update(&[1]);
+                    field(&mut h, reason.as_bytes());
+                }
+            }
         }
         Digest(h.finalize())
     }
@@ -1233,6 +1265,79 @@ mod tests {
         assert_eq!(l.records()[5].signature(), None);
         assert_eq!(l.records()[5].evidence.action, "scale web to 3");
         assert_eq!(l.records()[0].intent_digest(), None);
+    }
+
+    /// The reference intents with a review of each outcome attached.
+    fn reviewed_ledger() -> Ledger {
+        let review = |outcome| crate::Review {
+            model: "claude-opus-5-5".into(),
+            prompt_sha256: "9f".repeat(32),
+            outcome,
+        };
+        let mut l = Ledger::new();
+        l.append_intent(
+            &signed_intent().with_review(review(crate::ReviewOutcome::Defer(
+                "drops \"web\"\n🦀".into(),
+            ))),
+            "defer",
+            Some("drops \"web\"\n🦀".into()),
+            vec![("ai-review".into(), "defer".into())],
+        );
+        l.append_intent(
+            &unsigned_intent().with_review(review(crate::ReviewOutcome::Clear)),
+            "admit",
+            None,
+            vec![("ai-review".into(), "admit".into())],
+        );
+        l.append_intent(
+            &unsigned_intent().with_review(review(crate::ReviewOutcome::Skipped(String::new()))),
+            "admit",
+            None,
+            vec![("ai-review".into(), "admit".into())],
+        );
+        l
+    }
+
+    #[test]
+    fn a_review_is_item_12_of_the_documented_encoding() {
+        // Computed by an independent implementation (tools/verify-ledger.mjs,
+        // Node's crypto) written from the "Record encoding" docs.
+        let want = [
+            "1e3169e13bc228fd64a88dbbc2ab96c50daabf5be628cba9b808120085c22ce0",
+            "09837a7d1097043b0c970720ba587862e78402523ade18b24e485e509c51a273",
+            "aa65eb6d2ad8ab8b3572c3bdbcedc05b8a03f632b8ae47c8ff1ba962c4abfe17",
+        ];
+        let l = reviewed_ledger();
+        let got: Vec<String> = l.records().iter().map(|r| r.digest.to_string()).collect();
+        assert_eq!(got, want);
+        assert!(l.verify());
+        // Without its review, a record digests as it did before reviews
+        // existed: as a record about the bare intent.
+        let reviewed = &l.records()[0];
+        let mut bare = reviewed.clone();
+        bare.intent.as_mut().unwrap().review = None;
+        let mut plain = Ledger::new();
+        plain.append_intent(
+            &signed_intent(),
+            "defer",
+            reviewed.evidence.reason.clone(),
+            reviewed.evidence.policies.clone(),
+        );
+        assert_eq!(bare.compute_digest(), plain.records()[0].digest);
+        assert_ne!(bare.compute_digest(), reviewed.digest);
+        // Every part of the review is covered.
+        let edits: [fn(&mut crate::Review); 5] = [
+            |r| r.model.push('!'),
+            |r| r.prompt_sha256 = "00".repeat(32),
+            |r| r.outcome = crate::ReviewOutcome::Clear,
+            |r| r.outcome = crate::ReviewOutcome::Skipped("drops \"web\"\n🦀".into()),
+            |r| r.outcome = crate::ReviewOutcome::Defer("other".into()),
+        ];
+        for (n, edit) in edits.iter().enumerate() {
+            let mut tampered = reviewed.clone();
+            edit(tampered.intent.as_mut().unwrap().review.as_mut().unwrap());
+            assert_ne!(tampered.compute_digest(), reviewed.digest, "edit {n}");
+        }
     }
 
     #[test]

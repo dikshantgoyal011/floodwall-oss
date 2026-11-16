@@ -8,12 +8,16 @@
 //! none, one or two policy bundles, in awkward text too. The same ledger is
 //! also kept on disk (`durable.jsonl`), which must be the export byte for
 //! byte, and the export must read back into the same ledger.
+//!
+//! A second export, `reviewed.jsonl`, holds intents carrying a model's
+//! review with every outcome, in awkward text too, next to one without, for
+//! the verifier's check of item 12 of the record encoding.
 
 use std::fs;
 use std::path::Path;
 
 use floodwall::export::keys_json;
-use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority};
+use floodwall::intent::{Action, AgentId, BlastRadius, Intent, Priority, Review, ReviewOutcome};
 use floodwall::sha256::sha256;
 use floodwall::{BundleId, Digest, Keyring, Ledger, SigningKey};
 
@@ -100,6 +104,88 @@ fn fill(ledger: &mut Ledger) {
     ledger.checkpoint(); // size 8
 }
 
+fn fixture_dir() -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("target dir")
+        .join("export-fixture");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn write_an_export_with_reviews_for_the_independent_verifier() {
+    let plane = SigningKey::from_seed(&[1; 32]);
+    let keys = agent_keys();
+    let mut ledger = Ledger::new().with_checkpoints(2).with_signer(plane);
+    ledger.checkpoint();
+    let outcomes = [
+        None,
+        Some(ReviewOutcome::Clear),
+        Some(ReviewOutcome::Defer(
+            "drops the \"orders\" table\nwithout a backup 🦀".into(),
+        )),
+        Some(ReviewOutcome::Skipped("timeout after 8000 ms".into())),
+        Some(ReviewOutcome::Defer(String::new())),
+    ];
+    for (i, outcome) in outcomes.into_iter().enumerate() {
+        let who = i % 2;
+        let mut intent = Intent::new(
+            i as u64 + 1,
+            AgentId::new(AGENTS[who]),
+            Action::Destroy {
+                resource: "orders-db".into(),
+            },
+            Priority::Urgent,
+            BlastRadius::Region,
+        )
+        .signed(&keys[who]);
+        if let Some(outcome) = outcome {
+            intent = intent.with_review(Review {
+                model: if i == 3 {
+                    "modèle \"x\"".into()
+                } else {
+                    "claude-opus-5-5".into()
+                },
+                prompt_sha256: format!("{:064x}", i * 0x1234_5678),
+                outcome,
+            });
+        }
+        let verdict = match &intent.review {
+            Some(Review {
+                outcome: ReviewOutcome::Defer(_),
+                ..
+            }) => "defer",
+            _ => "admit",
+        };
+        let mut policies = vec![("conflict-window".to_string(), "admit".to_string())];
+        if intent.review.is_some() {
+            policies.push(("ai-review".to_string(), verdict.to_string()));
+        }
+        ledger.append_intent_with(&intent, verdict, None, policies, bundles(i as u64));
+    }
+    ledger.checkpoint();
+    assert!(ledger.verify());
+
+    let mut whole = Vec::new();
+    ledger.export_jsonl(&mut whole).unwrap();
+    let text = String::from_utf8(whole.clone()).unwrap();
+    assert!(text.contains("\"outcome\":\"clear\"}"));
+    assert!(text.contains("\"outcome\":\"skipped\",\"reason\":\"timeout after 8000 ms\"}"));
+    assert!(text.contains("\"signature\":\""));
+    fs::write(fixture_dir().join("reviewed.jsonl"), &whole).unwrap();
+
+    // It reads back into the same ledger, reviews and all.
+    let back = Ledger::read_jsonl(&whole[..]).unwrap();
+    assert_eq!(back.head(), ledger.head());
+    for (a, b) in back.records().iter().zip(ledger.records()) {
+        assert_eq!(a.intent, b.intent);
+    }
+    let mut again = Vec::new();
+    back.export_jsonl(&mut again).unwrap();
+    assert_eq!(again, whole);
+}
+
 #[test]
 fn write_an_edge_case_export_for_the_independent_verifier() {
     let plane = SigningKey::from_seed(&[1; 32]);
@@ -120,11 +206,7 @@ fn write_an_edge_case_export_for_the_independent_verifier() {
     assert!(ledger.verify());
     assert_eq!(ledger.verify_signatures(&keyring), Ok(8));
 
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .parent()
-        .expect("target dir")
-        .join("export-fixture");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = fixture_dir();
     let mut whole = Vec::new();
     ledger.export_jsonl(&mut whole).unwrap();
     fs::write(dir.join("edge.jsonl"), &whole).unwrap();

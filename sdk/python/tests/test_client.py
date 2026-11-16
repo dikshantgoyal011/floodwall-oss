@@ -275,6 +275,7 @@ class ClientTest(unittest.TestCase):
 
         class Redirect(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 self.send_response(307)
                 self.send_header("Location", f"http://127.0.0.1:{target.server_port}/x")
                 self.end_headers()
@@ -294,6 +295,35 @@ class ClientTest(unittest.TestCase):
             for server in (target, front):
                 server.shutdown()
                 server.server_close()
+
+
+class ContextTest(unittest.TestCase):
+    def test_context_is_sent_top_level_and_not_part_of_the_intent(self):
+        calls, opener = stub(lambda c: (200, {"verdict": "admit"}))
+        fw = client(opener)
+        change = {**SCALE, "context": "- replicas: 1\n+ replicas: 3"}
+        self.assertNotIn("context", fw.intent(change))
+        fw.submit(change)
+        self.assertEqual(calls[0]["body"]["context"], "- replicas: 1\n+ replicas: 3")
+        body = dict(calls[0]["body"])
+        body.pop("context")
+        self.assertEqual(intent_bytes(body), intent_bytes({**body, "context": "other"}))
+        fw.guard({**SCALE, "context": "plan"}, lambda: None)
+        self.assertEqual(calls[1]["body"]["context"], "plan")
+        fw.submit(SCALE)
+        self.assertNotIn("context", calls[-1]["body"])
+
+    def test_bad_context_is_refused_before_sending(self):
+        calls, opener = stub(lambda c: (200, {"verdict": "admit"}))
+        fw = client(opener)
+        with self.assertRaises(ValueError):
+            fw.submit({**SCALE, "context": "x" * 65537})
+        with self.assertRaises(ValueError):
+            fw.guard({**SCALE, "context": "\u00e9" * 40000}, lambda: self.fail("applied"))
+        with self.assertRaises(ValueError):
+            fw.submit({**SCALE, "context": 5})
+        fw.submit({**SCALE, "context": "x" * 65536})
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

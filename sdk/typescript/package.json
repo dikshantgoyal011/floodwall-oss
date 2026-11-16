@@ -1,6 +1,6 @@
 {
   "name": "@floodwall/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Ask a Floodwall Cloud plane before your agent changes production.",
   "license": "MIT",
   "type": "module",

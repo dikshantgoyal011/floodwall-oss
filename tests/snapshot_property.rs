@@ -23,7 +23,9 @@
 //! Some floods sign their intents with a keyring, and some name the
 //! settings they start with, so every snapshot names its settings.
 
-use floodwall::intent::{Action, AgentId, BlastRadius, Intent, IntentKey, Priority};
+use floodwall::intent::{
+    Action, AgentId, BlastRadius, Intent, IntentKey, Priority, Review, ReviewOutcome,
+};
 use floodwall::policy::{NoGlobalDestroy, ResourceAllowlist};
 use floodwall::reconfigure::Settings;
 use floodwall::sha256::sha256;
@@ -208,17 +210,31 @@ fn random_intent(rng: &mut Rng, agent: &str, id: u64, signed: bool) -> Intent {
         4..=9 => BlastRadius::Service,
         _ => BlastRadius::Cell,
     };
-    let intent = Intent::new(id, AgentId::new(agent), action, priority, blast);
-    if !signed {
-        return intent;
+    let mut intent = Intent::new(id, AgentId::new(agent), action, priority, blast);
+    if signed {
+        // Now and then a forgery: signed with another agent's key.
+        let signer = if rng.chance(5) {
+            AGENTS[(AGENTS.iter().position(|a| *a == agent).unwrap() + 1) % AGENTS.len()]
+        } else {
+            agent
+        };
+        intent = intent.signed(&key_of(signer));
     }
-    // Now and then a forgery: signed with another agent's key.
-    let signer = if rng.chance(5) {
-        AGENTS[(AGENTS.iter().position(|a| *a == agent).unwrap() + 1) % AGENTS.len()]
-    } else {
-        agent
-    };
-    intent.signed(&key_of(signer))
+    // Some intents carry a model's review, attached after signing as the
+    // plane does: replay reads it from the ledger and must decide the same.
+    if rng.chance(30) {
+        let outcome = match rng.below(3) {
+            0 => ReviewOutcome::Clear,
+            1 => ReviewOutcome::Defer(format!("review {} looks risky", rng.below(3))),
+            _ => ReviewOutcome::Skipped("timeout".into()),
+        };
+        intent = intent.with_review(Review {
+            model: "claude-opus-5-5".into(),
+            prompt_sha256: format!("{:064x}", rng.next()),
+            outcome,
+        });
+    }
+    intent
 }
 
 /// One call to a plane.

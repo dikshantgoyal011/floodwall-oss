@@ -171,11 +171,18 @@ class Floodwall:
         return intent
 
     def submit(self, change: Dict[str, Any]) -> Dict[str, Any]:
-        """Offer a change; returns the plane's first answer (admit, held, rejected or queued)."""
-        return self._post(self.prepare(change))
+        """Offer a change; returns the plane's first answer (admit, held, rejected or queued).
 
-    def _post(self, intent: Dict[str, Any]) -> Dict[str, Any]:
-        answer = self._request("POST", f"/v1/planes/{_q(self.plane)}/intents", intent)
+        ``change["context"]`` (a string up to 64 KiB, such as a diff or plan) goes to
+        the plane as a top-level field for its AI review; it is never part of the
+        signed intent bytes.
+        """
+        context = _context(change)
+        return self._post(self.prepare(change), context)
+
+    def _post(self, intent: Dict[str, Any], context: Optional[str] = None) -> Dict[str, Any]:
+        body = intent if context is None else {**intent, "context": context}
+        answer = self._request("POST", f"/v1/planes/{_q(self.plane)}/intents", body)
         return _decision(answer, intent["agent"], intent["id"])
 
     def wait(self, key: Dict[str, str], timeout_seconds: float = 300) -> Dict[str, Any]:
@@ -220,9 +227,10 @@ class Floodwall:
         result is returned and ``on_report_error`` is told. Only transport failures
         and 5xx count as unreachable; invalid changes and signing errors always raise.
         """
+        context = _context(change)
         intent = self.prepare(change)
         try:
-            first = self._post(intent)
+            first = self._post(intent, context)
         except Exception as error:  # noqa: BLE001 - classified below
             if self.when_unreachable == "open" and _unreachable(error):
                 self.on_fail_open(intent, error)
@@ -271,6 +279,21 @@ class Floodwall:
                     continue
                 raise FloodwallError(error.code, parsed.get("error") or f"floodwall answered {error.code}", parsed) from None
         raise AssertionError("unreachable")
+
+
+MAX_CONTEXT_BYTES = 64 * 1024
+
+
+def _context(change: Dict[str, Any]) -> Optional[str]:
+    """The change's ``context``, checked: None when absent or empty, else a string of at most 64 KiB."""
+    context = change.get("context")
+    if context is None or context == "":
+        return None
+    if not isinstance(context, str):
+        raise ValueError("context must be a string")
+    if len(context.encode("utf-8")) > MAX_CONTEXT_BYTES:
+        raise ValueError(f"context must be at most {MAX_CONTEXT_BYTES} bytes")
+    return context
 
 
 def _q(value: Any) -> str:

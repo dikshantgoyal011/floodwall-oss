@@ -22,6 +22,11 @@
 //!   verdict), and re-hashing the chain so the ledger still verifies, makes
 //!   resuming fail at exactly that record.
 //!
+//! About a third of the intents carry a model's review (FW-1004), with
+//! every outcome: a review that defers holds the intent like any policy,
+//! and replay reproduces it from the review the ledger records, never
+//! asking a model.
+//!
 //! Half the planes also load a rules file that declares itself a policy
 //! bundle, so their decisions record it, and every property holds with the
 //! bundles in the ledger too. Some put what is in flight on a lease, which
@@ -38,12 +43,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use floodwall::intent::{Action, AgentId, BlastRadius, Intent, IntentKey, Priority};
+use floodwall::intent::{
+    Action, AgentId, BlastRadius, Intent, IntentKey, Priority, Review, ReviewOutcome,
+};
 use floodwall::policy::{BlastNeedsPriority, NoGlobalDestroy, ResourceAllowlist};
 use floodwall::sha256::sha256;
 use floodwall::{
     Admission, Aging, Floodwall, Gate, Held, HoldConfig, Keyring, Lease, Ledger, Outcome,
-    RateLimit, Record, ResumeError, SchedulerConfig, SigningKey, LAPSED, QUEUED,
+    RateLimit, Record, ResumeError, SchedulerConfig, SigningKey, AI_REVIEW, LAPSED, QUEUED,
 };
 
 /// A tiny xorshift PRNG, so every seed is reproducible.
@@ -233,17 +240,31 @@ fn random_intent(rng: &mut Rng, agent: &str, id: u64, signed: bool) -> Intent {
         4..=9 => BlastRadius::Service,
         _ => BlastRadius::Cell,
     };
-    let intent = Intent::new(id, AgentId::new(agent), action, priority, blast);
-    if !signed {
-        return intent;
+    let mut intent = Intent::new(id, AgentId::new(agent), action, priority, blast);
+    if signed {
+        // Now and then a forgery: signed with another agent's key.
+        let signer = if rng.chance(5) {
+            AGENTS[(AGENTS.iter().position(|a| *a == agent).unwrap() + 1) % AGENTS.len()]
+        } else {
+            agent
+        };
+        intent = intent.signed(&key_of(signer));
     }
-    // Now and then a forgery: signed with another agent's key.
-    let signer = if rng.chance(5) {
-        AGENTS[(AGENTS.iter().position(|a| *a == agent).unwrap() + 1) % AGENTS.len()]
-    } else {
-        agent
-    };
-    intent.signed(&key_of(signer))
+    // Some intents carry a model's review, attached after signing as the
+    // plane does: replay reads it from the ledger and must decide the same.
+    if rng.chance(30) {
+        let outcome = match rng.below(3) {
+            0 => ReviewOutcome::Clear,
+            1 => ReviewOutcome::Defer(format!("review {} looks risky", rng.below(3))),
+            _ => ReviewOutcome::Skipped("timeout".into()),
+        };
+        intent = intent.with_review(Review {
+            model: "claude-opus-5-5".into(),
+            prompt_sha256: format!("{:064x}", rng.next()),
+            outcome,
+        });
+    }
+    intent
 }
 
 /// Everything the plane shows about itself: its clock, and its queue, what
@@ -518,6 +539,10 @@ struct Coverage {
     /// Floods whose ledger aging changed: run without it, they write
     /// another one.
     aged: usize,
+    /// Decisions an AI review deferred.
+    review_deferred: usize,
+    /// Decisions on a reviewed intent the review did not defer.
+    review_admitted: usize,
 }
 
 /// Every property, for one seed.
@@ -640,6 +665,14 @@ fn check(seed: u64, signed: bool, cov: &mut Coverage) {
         if !r.evidence.bundles.is_empty() {
             cov.bundled += 1;
         }
+        for (name, label) in &r.evidence.policies {
+            if name == AI_REVIEW {
+                match label.as_str() {
+                    "defer" => cov.review_deferred += 1,
+                    _ => cov.review_admitted += 1,
+                }
+            }
+        }
         match r.verdict.as_str() {
             QUEUED => cov.queued += 1,
             "admit" => cov.admitted += 1,
@@ -677,6 +710,8 @@ fn replay_reproduces_the_live_decisions() {
         cov.lapsed,
         cov.overdue,
         cov.bundled,
+        cov.review_deferred,
+        cov.review_admitted,
     ] {
         assert!(count > 100, "{cov:?}");
     }

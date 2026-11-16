@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "floodwall": {
+      "command": "npx",
+      "args": ["-y", "@floodwall/mcp@0.1.0"],
+      "env": {
+        "FLOODWALL_API_KEY": "fw_live_...",
+        "FLOODWALL_PLANE": "pl_...",
+        "FLOODWALL_AGENT": "claude-code"
+      }
+    }
+  }
+}

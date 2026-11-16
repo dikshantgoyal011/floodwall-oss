@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "floodwall"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ask a Floodwall Cloud plane before your agent changes production."
 readme = "README.md"
 license = "MIT"
@@ -16,6 +16,8 @@ dependencies = []
 [project.optional-dependencies]
 # Only for planes that require signed intents.
 signing = ["cryptography>=41"]
+# Only for floodwall.langgraph.guard_node (guarded_tool needs no extra).
+langgraph = ["langgraph>=0.2"]
 
 [tool.setuptools]
 # Only the client; tests/ is not part of the package.

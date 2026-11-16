@@ -39,7 +39,9 @@
 //!   later `open` needs with it.
 //! - `submit`: `intent` (in the export's intent form), `now`. The intent is
 //!   offered, and if it gets in a pass runs at once: `accepted`, `refused`
-//!   (why not), `report`.
+//!   (why not), `report`. An intent a model reviewed carries its `review`
+//!   object in that form too (see [`crate::export`]); the gate adds it to
+//!   the breakdown as `ai-review` (see [AI review](crate::gate#ai-review)).
 //! - `tick`: `now`. `report`.
 //! - `release` / `expire`: `agent`, `id`, `by`, `now`. A release is followed
 //!   by a pass: `report`.
@@ -1189,6 +1191,106 @@ mod tests {
             Value::Null,
             "{verify}"
         );
+    }
+
+    #[test]
+    fn a_submitted_intent_carries_its_review_through_the_plane() {
+        let reviewed = |id: u64, review: &str| {
+            let plain = intent("bot", id, "web");
+            format!(
+                "{{\"op\":\"submit\",\"intent\":{},\"review\":{review}}},\"now\":{id}}}",
+                &plain[..plain.len() - 1]
+            )
+        };
+        let sha = "ab".repeat(32);
+        let defer = format!(
+            "{{\"model\":\"claude-opus-5-5\",\"prompt_sha256\":\"{sha}\",\"outcome\":\"defer\",\"reason\":\"drops a table\"}}"
+        );
+        let clear = format!(
+            "{{\"model\":\"claude-opus-5-5\",\"prompt_sha256\":\"{sha}\",\"outcome\":\"clear\"}}"
+        );
+        let mut host = Host::new();
+        let mut stored = lines(&host.handle(&open("")));
+
+        // web is allowed by the rules: only the review holds it.
+        let a = host.handle(&reviewed(1, &defer));
+        assert_eq!(field(&a, &["accepted"]), Value::Bool(true), "{a}");
+        let Value::Array(decisions) = field(&a, &["report", "decisions"]) else {
+            panic!("{a}")
+        };
+        assert_eq!(
+            get(&decisions[0], "verdict").ok().unwrap(),
+            &Value::String("defer".into())
+        );
+        assert!(
+            a.contains(
+                "{\"policy\":\"ai-review\",\"verdict\":\"defer\",\"reason\":\"drops a table\"}"
+            ),
+            "{a}"
+        );
+        let new = lines(&a);
+        assert!(
+            new.iter()
+                .filter(|l| l.contains("\"type\":\"record\""))
+                .all(|l| l.contains(&defer)),
+            "{new:?}"
+        );
+        stored.extend(new);
+        let state = host.handle("{\"op\":\"state\"}");
+        assert!(state.contains(&format!("\"review\":{}", &defer)), "{state}");
+
+        // A clear review admits nothing the rules would not.
+        let a = host.handle(&reviewed(2, &clear));
+        let Value::Array(decisions) = field(&a, &["report", "decisions"]) else {
+            panic!("{a}")
+        };
+        assert_eq!(
+            get(&decisions[0], "verdict").ok().unwrap(),
+            &Value::String("admit".into())
+        );
+        stored.extend(lines(&a));
+
+        // The held, reviewed intent survives a snapshot and a reopen from
+        // the lines alone.
+        let a = host.handle("{\"op\":\"snapshot\"}");
+        stored.extend(lines(&a));
+        let snapshot = snapshot_of(&a);
+        assert!(snapshot.contains(&defer), "{snapshot}");
+        let state = plane_state(&mut host);
+        let mut from_snapshot = Host::new();
+        let a = from_snapshot.handle(&open_from(&snapshot, ""));
+        assert_eq!(field(&a, &["ok"]), Value::Bool(true), "{a}");
+        assert_eq!(plane_state(&mut from_snapshot), state);
+        let mut from_lines = Host::new();
+        let a = from_lines.handle(&open(&stored.join("\n")));
+        assert_eq!(field(&a, &["ok"]), Value::Bool(true), "{a}");
+        assert_eq!(plane_state(&mut from_lines), state);
+
+        // A release waives the review's defer like any other (once bot#2
+        // frees the web lane).
+        both(
+            &mut host,
+            &mut from_snapshot,
+            "{\"op\":\"complete\",\"agent\":\"bot\",\"id\":\"2\",\"outcome\":\"succeeded\",\"reason\":null,\"now\":3}",
+        );
+        let release =
+            "{\"op\":\"release\",\"agent\":\"bot\",\"id\":\"1\",\"by\":\"alice\",\"now\":3}";
+        let a = both(&mut host, &mut from_snapshot, release);
+        assert!(
+            a.contains("released by alice, overriding: drops a table"),
+            "{a}"
+        );
+
+        // A malformed review is refused.
+        for bad in [
+            format!("{{\"model\":\"m\",\"prompt_sha256\":\"{sha}\",\"outcome\":\"admit\"}}"),
+            format!("{{\"model\":\"m\",\"prompt_sha256\":\"{sha}\",\"outcome\":\"defer\"}}"),
+            format!("{{\"model\":\"m\",\"prompt_sha256\":\"{sha}\",\"outcome\":\"clear\",\"reason\":\"x\"}}"),
+            "{\"model\":\"m\",\"prompt_sha256\":\"AB\",\"outcome\":\"clear\"}".to_string(),
+        ] {
+            let a = host.handle(&reviewed(9, &bad));
+            assert_eq!(field(&a, &["code"]), Value::String("bad_request".into()), "{a}");
+        }
     }
 
     #[test]

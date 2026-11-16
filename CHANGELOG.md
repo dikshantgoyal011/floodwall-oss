@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
+  `context` (a diff or plan, at most 64 KiB) on `submit` and `guard`, sent as
+  a top-level field for the plane's AI review and never part of the signed
+  intent bytes. `floodwall.langgraph` (`guarded_tool`, `guard_node`; extra
+  `floodwall[langgraph]`).
+- `@floodwall/mcp` 0.1.0: an MCP server (stdio and streamable HTTP), a Claude
+  Code `PreToolUse`/`PostToolUse` hook and Claude Agent SDK hooks. It depends
+  on `@floodwall/client` ^0.2.0, so publish the client first.
+- **AI review on intents (FW-1004).** An intent may carry a `Review`
+  (model, prompt SHA-256, outcome `clear`, `defer` or `skipped`) that the
+  plane attaches, never the agent: it is not part of `Intent::digest`, so
+  agents' signatures are unchanged. The gate adds it as an `ai-review`
+  entry under deny-overrides, so a review can defer but never admit.
+- **Ledger records may carry an optional item 12.** A record whose intent
+  has a review appends the review to its digest input; the record
+  encoding name stays `floodwall/ledger/record/v4`, and every record
+  without a review digests exactly as before. Exports carry the review in
+  the intent object. Verifiers pinned to an older `tools/verify-ledger.mjs`
+  refuse such records ("unknown field review") rather than mis-verify
+  them: upgrade the verifier to audit ledgers from planes with AI review.
+
 ### Changed
 
 - **Breaking for clients that reuse or reorder ids:** on a plane with a
@@ -57,7 +80,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   To check a ledger still being written, pass `--allow-uncovered-tail`:
   the summary then says how many records no signed checkpoint covers.
   Without a plane key, nothing changes.
-
 
 ### Added
 

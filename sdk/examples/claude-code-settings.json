@@ -1,0 +1,27 @@
+{
+  "env": {
+    "FLOODWALL_API_KEY_FILE": "/home/you/.config/floodwall/agent-key",
+    "FLOODWALL_PLANE": "pl_...",
+    "FLOODWALL_HOOK_BLAST": "service"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "npx -y -p @floodwall/mcp@0.1.0 floodwall-claude-hook", "timeout": 90 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "npx -y -p @floodwall/mcp@0.1.0 floodwall-claude-hook", "timeout": 30 }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "npx -y -p @floodwall/mcp@0.1.0 floodwall-claude-hook", "timeout": 30 }]
+      }
+    ]
+  }
+}

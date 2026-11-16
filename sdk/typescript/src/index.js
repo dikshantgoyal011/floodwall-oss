@@ -14,6 +14,8 @@ const MIN_POLL_MS = 1000;
 /** A 429's Retry-After is waited out up to this, however long it asks for. */
 const MAX_RETRY_AFTER_SECONDS = 60;
 const MAX_REASON = 1024;
+/** The most `context` (a diff or plan, for the plane's AI review) a submit may carry, in UTF-8 bytes. */
+export const MAX_CONTEXT_BYTES = 64 * 1024;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
@@ -143,13 +145,19 @@ export class Floodwall {
     return intent;
   }
 
-  /** Offer a change. Resolves to the plane's first answer: admit, defer (held), reject, or queued. */
+  /**
+   * Offer a change. Resolves to the plane's first answer: admit, defer (held), reject, or queued.
+   * `change.context` (a string up to 64 KiB, such as a diff or plan) goes to the plane as a top-level
+   * field for its AI review; it is never part of the signed intent bytes.
+   */
   async submit(change) {
-    return this.post(await this.prepare(change));
+    const context = contextOf(change);
+    return this.post(await this.prepare(change), context);
   }
 
-  async post(intent) {
-    const answer = await this.request("POST", `/v1/planes/${enc(this.plane)}/intents`, intent);
+  async post(intent, context) {
+    const body = context === undefined ? intent : { ...intent, context };
+    const answer = await this.request("POST", `/v1/planes/${enc(this.plane)}/intents`, body);
     return decision(answer, intent);
   }
 
@@ -194,10 +202,11 @@ export class Floodwall {
    * Only transport failures and 5xx count as unreachable; invalid changes and signing errors always throw.
    */
   async guard(change, apply, { timeoutSeconds = 300 } = {}) {
+    const context = contextOf(change);
     const intent = await this.prepare(change);
     let first;
     try {
-      first = await this.post(intent);
+      first = await this.post(intent, context);
     } catch (error) {
       if (this.whenUnreachable === "open" && unreachable(error)) {
         this.onFailOpen(intent, error);
@@ -263,6 +272,17 @@ export class Floodwall {
     }
     return parsed;
   }
+}
+
+/** The change's `context`, checked: undefined when absent or empty, else a string of at most 64 KiB. */
+function contextOf(change) {
+  const context = change?.context;
+  if (context === undefined || context === null || context === "") return undefined;
+  if (typeof context !== "string") throw new TypeError("context must be a string");
+  if (new TextEncoder().encode(context).length > MAX_CONTEXT_BYTES) {
+    throw new TypeError(`context must be at most ${MAX_CONTEXT_BYTES} bytes`);
+  }
+  return context;
 }
 
 /** The URL with any slashes at its end taken off; a loop, so no input makes it slow. */

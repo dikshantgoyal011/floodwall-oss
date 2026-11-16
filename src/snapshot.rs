@@ -107,6 +107,10 @@
 //!  "digest":"<hex>"}
 //! ```
 //!
+//! Each `<intent>` is in the export's intent form, with its `review` when
+//! a model reviewed it (see [`crate::export`]), so a held intent keeps the
+//! review that holds it.
+//!
 //! `digest` is SHA-256 over the field `floodwall/snapshot/v1` (its length as
 //! a little-endian `u64`, then the bytes) followed by the line's bytes up to
 //! the comma before `"digest"`. [`Snapshot::from_json`] refuses a line whose

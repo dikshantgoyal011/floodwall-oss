@@ -90,9 +90,9 @@ pub use admission::{Admission, InvalidRateLimit, RateLimit, Rejected};
 pub use checkpoint::{audit_suffix, AuditError, Checkpoint};
 pub use durable::{ReadError, WriteError};
 pub use ed25519::{InvalidKey, Signature, SigningKey, VerifyingKey};
-pub use gate::{Gate, GateDecision};
+pub use gate::{Gate, GateDecision, AI_REVIEW};
 pub use hold::{Held, HoldConfig, HoldError};
-pub use intent::{Intent, IntentKey};
+pub use intent::{Intent, IntentKey, Review, ReviewOutcome};
 pub use keyring::{AuthError, Keyring};
 pub use ledger::{Digest, Evidence, Ledger, Record, SignatureError, SignatureProblem};
 pub use merkle::FrontierFull;
@@ -1578,6 +1578,77 @@ mod tests {
         p.complete(&key, Outcome::Succeeded, 3).unwrap();
         p.submit(off_list(2), 3).unwrap();
         assert_eq!(verdicts(&p.tick(3)), ["defer"]);
+    }
+
+    fn reviewed(id: u64, resource: &str, outcome: crate::ReviewOutcome) -> Intent {
+        scale(id, resource).with_review(crate::Review {
+            model: "claude-opus-5-5".into(),
+            prompt_sha256: "c0".repeat(32),
+            outcome,
+        })
+    }
+
+    #[test]
+    fn an_ai_review_defers_and_a_release_waives_it() {
+        let mut p = plane();
+        let deferred = reviewed(1, "web", crate::ReviewOutcome::Defer("risky".into()));
+        let key = deferred.key();
+        p.submit(deferred.clone(), 0).unwrap();
+        p.submit(reviewed(2, "api", crate::ReviewOutcome::Clear), 0)
+            .unwrap();
+        p.submit(
+            reviewed(3, "web", crate::ReviewOutcome::Skipped("timeout".into())),
+            0,
+        )
+        .unwrap();
+        p.submit(reviewed(4, "cache", crate::ReviewOutcome::Clear), 0)
+            .unwrap();
+        let report = p.tick(0);
+        // Only the review defers web; a clear review never admits cache past
+        // the allowlist.
+        assert_eq!(verdicts(&report), ["defer", "admit", "admit", "defer"]);
+        assert_eq!(report.decisions[0].verdict, Verdict::Defer("risky".into()));
+        assert_eq!(
+            report.decisions[3].verdict,
+            Verdict::Defer("resource 'cache' is not on the allowlist".into())
+        );
+        let decision = p
+            .ledger()
+            .records()
+            .iter()
+            .find(|r| r.verdict == "defer" && r.intent_id == 1)
+            .unwrap();
+        assert_eq!(decision.intent.as_ref(), Some(&deferred));
+        assert!(decision
+            .evidence
+            .policies
+            .contains(&(AI_REVIEW.to_string(), "defer".to_string())));
+        assert_eq!(p.held().next().unwrap().reason, "risky");
+
+        // #3 holds the web lane until it completes.
+        p.complete(&IntentKey::new("bot", 3), Outcome::Succeeded, 1)
+            .unwrap();
+        p.release(&key, "alice", 1).unwrap();
+        let report = p.tick(1);
+        assert_eq!(verdicts(&report), ["admit"]);
+        assert_eq!(
+            p.ledger()
+                .records()
+                .last()
+                .unwrap()
+                .evidence
+                .reason
+                .as_deref(),
+            Some("released by alice, overriding: risky")
+        );
+
+        // The review is in the ledger, so a replay decides the same without it
+        // being asked for again.
+        let mut export = Vec::new();
+        p.ledger().export_jsonl(&mut export).unwrap();
+        let ledger = Ledger::read_jsonl(&export[..]).unwrap();
+        let resumed = plane().resume(ledger, 1).unwrap();
+        assert_eq!(resumed.ledger().head(), p.ledger().head());
     }
 
     /// A policy whose answer changes while an intent is held.

@@ -13,6 +13,10 @@ you can read and run them before you have a plane.
 | [`remediation-bot.py`](remediation-bot.py) | Python | Restarts unhealthy services, one intent each; handles held and rejected restarts. |
 | [`ci-gate.mjs`](ci-gate.mjs) + [`github-actions-deploy.yml`](github-actions-deploy.yml) | TypeScript, YAML | A CI step that asks before deploying, fails the job if not admitted, and reports the outcome. |
 | [`llm-agent-tool.mjs`](llm-agent-tool.mjs) | TypeScript | An AI agent's tool calls, each through `guard()`, with refusals handed back to the model as text. |
+| [`mcp-config.json`](mcp-config.json) | JSON | Registers the `@floodwall/mcp` server with Claude Code (`.mcp.json`) or Cursor (`.cursor/mcp.json`). |
+| [`claude-code-settings.json`](claude-code-settings.json) | JSON | Claude Code hooks: risky `Bash` commands are blocked unless the plane admits them, and the outcome is reported. |
+| [`agent-sdk-agent.mjs`](agent-sdk-agent.mjs) | TypeScript | A Claude Agent SDK agent with `claudeAgentSdkHooks()` guarding its shell commands. |
+| [`langgraph-agent.py`](langgraph-agent.py) | Python | A LangGraph agent with a `guarded_tool` and a `guard_node`. |
 | [`signed-agent.mjs`](signed-agent.mjs) | TypeScript | Makes an Ed25519 key, prints the public key for the plane's keyring, and signs intents. |
 
 ## Running them

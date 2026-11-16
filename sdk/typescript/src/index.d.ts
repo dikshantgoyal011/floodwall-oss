@@ -1,3 +1,5 @@
+/** The most `context` a submit may carry, in UTF-8 bytes. */
+export declare const MAX_CONTEXT_BYTES: number;
 export type Priority = "bulk" | "normal" | "urgent" | "pager";
 export type BlastRadius = "cell" | "service" | "region" | "global";
 export type Action =
@@ -14,6 +16,11 @@ export interface Change {
   blastRadius?: BlastRadius;
   /** Defaults to a new id above every id this client has used. */
   id?: number | string;
+  /**
+   * A diff or plan, up to 64 KiB of UTF-8, for the plane's AI review. Sent as a top-level `context`
+   * field with the intent; never signed and never stored by the plane.
+   */
+  context?: string;
 }
 
 /** An intent in the plane's own form. */

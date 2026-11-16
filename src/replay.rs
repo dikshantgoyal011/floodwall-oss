@@ -85,6 +85,15 @@
 //! it was made: that is what the ledger says, and, like who wrote the file,
 //! rests on its signed checkpoints.
 //!
+//! # AI review
+//!
+//! A model's review of an intent ([`crate::Review`]) is part of the intent
+//! the ledger stores, under the record's digest (see
+//! [Record encoding](crate::ledger#record-encoding)). A replay submits the
+//! intent as the ledger holds it, review and all, so the gate rules on the
+//! recorded review and reaches the same decision: no model is ever asked
+//! again, and a model that would now answer differently changes nothing.
+//!
 //! # Signatures
 //!
 //! A ledger that verifies is only a chain of consistent hashes, which
@@ -687,7 +696,7 @@ mod tests {
 
     #[derive(Clone)]
     enum Op {
-        Submit(Intent, u64),
+        Submit(Box<Intent>, u64),
         Tick(u64),
         Complete(&'static str, u64, bool, u64),
         Release(&'static str, u64, u64),
@@ -709,29 +718,29 @@ mod tests {
             BlastRadius::Global,
         );
         vec![
-            Submit(scale("a", 1, "web", 2), 0),
-            Submit(scale("a", 2, "cache", 2), 0), // off the allowlist
-            Submit(scale("b", 1, "web", 5), 0),   // contradicts a#1
-            Submit(destroy_all, 0),               // rejected by the gate
-            Submit(scale("a", 4, "api", 1), 0),   // rate-limited: no token left
-            Submit(scale("a", 1, "web", 2), 0),   // a duplicate
+            Submit(Box::new(scale("a", 1, "web", 2)), 0),
+            Submit(Box::new(scale("a", 2, "cache", 2)), 0), // off the allowlist
+            Submit(Box::new(scale("b", 1, "web", 5)), 0),   // contradicts a#1
+            Submit(Box::new(destroy_all), 0),               // rejected by the gate
+            Submit(Box::new(scale("a", 4, "api", 1)), 0),   // rate-limited: no token left
+            Submit(Box::new(scale("a", 1, "web", 2)), 0),   // a duplicate
             Tick(1),
             // Off the allowlist. The hold is full and a, b and c hold one
             // each, so the oldest of them goes: a#2.
-            Submit(scale("c", 1, "db", 1), 1),
+            Submit(Box::new(scale("c", 1, "db", 1)), 1),
             Tick(2),
             Complete("a", 1, true, 3),
             Release("b", 1, 4),
-            Submit(scale("a", 4, "api", 1), 4), // refilled by now
-            Submit(scale("a", 5, "cache", 1), 4),
-            Submit(scale("a", 6, "api", 2), 4), // rate-limited again
+            Submit(Box::new(scale("a", 4, "api", 1)), 4), // refilled by now
+            Submit(Box::new(scale("a", 5, "cache", 1)), 4),
+            Submit(Box::new(scale("a", 6, "api", 2)), 4), // rate-limited again
             Tick(4),
             Expire("c", 1, 6),
             Complete("b", 1, false, 7),
             Complete("a", 4, true, 7),
             Tick(8),
             Tick(12), // a#5 has been held for the TTL
-            Submit(scale("b", 3, "api", 3), 12),
+            Submit(Box::new(scale("b", 3, "api", 3)), 12),
             Tick(12),
         ]
     }
@@ -740,7 +749,7 @@ mod tests {
     /// by call.
     fn run(p: &mut Floodwall, op: &Op) -> String {
         match op {
-            Op::Submit(i, now) => format!("{:?}", p.submit(i.clone(), *now)),
+            Op::Submit(i, now) => format!("{:?}", p.submit(*i.clone(), *now)),
             Op::Tick(now) => {
                 let r = p.tick(*now);
                 let decided: Vec<String> = r
@@ -943,9 +952,9 @@ mod tests {
         // only its first decision on disk.
         let mut whole = plane();
         let ops = [
-            Op::Submit(scale("a", 1, "web", 2), 0),
-            Op::Submit(scale("a", 2, "api", 2), 0),
-            Op::Submit(scale("b", 1, "cache", 2), 0),
+            Op::Submit(Box::new(scale("a", 1, "web", 2)), 0),
+            Op::Submit(Box::new(scale("a", 2, "api", 2)), 0),
+            Op::Submit(Box::new(scale("b", 1, "cache", 2)), 0),
             Op::Tick(1),
         ];
         for op in &ops {

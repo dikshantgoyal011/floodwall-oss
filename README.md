@@ -1,6 +1,6 @@
 <h1 align="center">floodwall</h1>
 
-<p align="center"><em>A barrier for high-volume DevOps in the age of agents.</em></p>
+<p align="center"><em>A barrier for high-volume DevOps, built for AI agents.</em></p>
 
 ---
 
@@ -44,6 +44,8 @@ The unit that flows through all of it is an [`Intent`](src/intent.rs): a change 
 ## Floodwall Cloud
 
 To use a hosted plane instead of embedding the crate, follow the [Quickstart](QUICKSTART.md): make a plane and a key in the console, then wrap each change your agent makes in `guard()` from the [TypeScript](sdk/typescript) or [Python](sdk/python) client.
+
+Hosted planes also use a model where it helps an operator, never to loosen the wall: an AI-written summary of why each intent was held, rules drafted from a sentence (type-checked and dry run before anyone saves them), "Ask the ledger" answers that link the records they cite, and runaway-agent flags. Rule suggestions come from the plane's own holds and releases. On Business, AI review can send risky intents to a model, which may hold them for a person but can never admit one or waive a reject; its verdict is recorded in the ledger, so replay never calls a model. If a review can't finish (the model is slow, down or over the allowance), the intent waits for a person by default, or the rules decide alone if the plane's owner chooses. Each plan includes a monthly allowance of AI calls; past it, the explainer and the other AI features pause and the rules keep deciding. Models are reached through OpenRouter, and the explainer is off until an owner turns it on.
 
 ## Use
 
