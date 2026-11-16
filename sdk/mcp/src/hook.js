@@ -51,7 +51,15 @@ export function matchCommand(command, patterns) {
   // patterns, so ask for it plainly. A segment that runs the tool itself was read and found
   // harmless (`kubectl rollout status`, `kubectl get pods | grep delete`).
   const TOOL = /\b(kubectl|terraform|helm)\b/i;
-  const runsTool = (seg) => /^(?:\S+=\S*\s+)*(?:sudo\s+)?(?:\S*\/)?(kubectl|terraform|helm)\b/i.test(seg);
+  // The segment's command word, after any `VAR=value` assignments and `sudo`: word by word, no regex backtracking.
+  const runsTool = (seg) => {
+    const words = seg.split(/\s+/).filter(Boolean);
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+    if (words[i]?.toLowerCase() === "sudo") i += 1;
+    const command = (words[i] ?? "").split("/").pop().toLowerCase();
+    return command === "kubectl" || command === "terraform" || command === "helm";
+  };
   const hidden = segments.some((seg) => TOOL.test(seg) && !runsTool(seg));
   if (hidden && /\b(apply|delete|scale|replace|patch|rollout|destroy|install|upgrade|uninstall)\b/i.test(plain(joined))) {
     return refuse;
