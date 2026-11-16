@@ -22,6 +22,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Error alerts (FW-801).** An unhandled error in an API request, a failed
+  cron run or daily job, a failing plane alarm, a failed background task, or a
+  script error on the site (sent to the new `POST /errors`) now emails the
+  operators in `ADMIN_EMAILS` and, with the optional `ALERT_WEBHOOK_URL` secret,
+  posts to a Slack or Discord webhook. Each error signature alerts at most once
+  an hour (`error_alerts`, migration `0014`), at most 30 alerts go out an hour
+  for the Worker's failures and 5 for the site's (unverified) reports, and secrets, tokens, cookies, query strings and email addresses are
+  redacted before anything is stored or sent. `POST /errors` takes only the
+  allowed sites, 8 KB at most, 20 reports an hour per network.
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
   `context` (a diff or plan, at most 64 KiB) on `submit` and `guard`, sent as
   a top-level field for the plane's AI review and never part of the signed
