@@ -31,6 +31,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the Worker's failures and 5 for the site's (unverified) reports, and secrets, tokens, cookies, query strings and email addresses are
   redacted before anything is stored or sent. `POST /errors` takes only the
   allowed sites, 8 KB at most, 20 reports an hour per network.
+
+- **Account controls (FW-608).** Settings lists the devices signed in to the
+  account (browser, country, when it signed in and was last active, and which
+  is this one) and signs out one of them, every other one, or all of them.
+  The address can be changed with a code sent to the new one and another to
+  the current one: the old address is told and other devices are signed out.
+  A member who must sign in with SSO can't move off their organization's
+  address. The account can be
+  deleted with a code sent to its address, which removes its planes (ledgers,
+  R2 archives, keys), memberships, invites, sessions and the user row at
+  once; it is refused while other people are on the account or a paid plan
+  isn't set to cancel. Ledger lines in other accounts' planes stay (they are
+  hash-chained audit records); billing records stay with Paygate as tax law
+  requires. New routes under `/auth/account/` (api/README.md, "Account
+  controls"); migration `0015_account_controls.sql` adds the sessions'
+  `last_seen_at`, `device` and `country`, the `account_codes` table, and
+  `usage_pending.plan` (a deleted account's unreported usage is still billed).
+
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
   `context` (a diff or plan, at most 64 KiB) on `submit` and `guard`, sent as
   a top-level field for the plane's AI review and never part of the signed
