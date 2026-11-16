@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The AI features' default model is `deepseek/deepseek-v4-flash`.** The
+  earlier default, `anthropic/claude-opus-5-5`, is not an OpenRouter model id
+  (OpenRouter writes `claude-opus-5.5`), so every model call failed once a key
+  was set. DeepSeek V4 Flash was chosen from every OpenRouter model with
+  strict JSON outputs and endpoints that neither train on nor keep prompts,
+  ranked on LiveBench (2026-06-25) for reasoning, instruction following, data
+  analysis and language against cost: about $0.36 per thousand calls, against
+  roughly $16 for Opus 5.5. `AI_MODEL` still picks any other model
+  (`deepseek/deepseek-v4-pro` is the step up). Requests no longer send
+  `temperature`, which current Claude and OpenAI models refuse, and ask for
+  low reasoning effort.
+
 ### Added
 
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
