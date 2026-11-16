@@ -31,6 +31,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Hosted planes refuse a different intent under a finished key** (409
+  `duplicate`) on every plane, not only those with a keyring. Before, a
+  plane without a keyring ruled on it as new, which also let an agent reuse
+  a finished key to skip the AI review. The same intent sent again still
+  answers its stored status. The SDKs never reuse ids.
+- **The Claude Code / Agent SDK hook rules a kubectl command that acts on
+  more than one object as a global destroy**: several names, several `-f`,
+  names with `-f`, or a file with several documents or a `List`. Before, it
+  was ruled on as its first object. Attached short flags (`-nprod`,
+  `-fx.yaml`) are now read.
+
 - **Breaking for clients that reuse or reorder ids:** on a plane with a
   keyring, `Rejected::Duplicate` now also means "this id is not above the
   highest id already queued for the agent", and such an intent will never

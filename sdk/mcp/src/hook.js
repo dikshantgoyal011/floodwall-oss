@@ -90,14 +90,21 @@ function positionals(words) {
   return out;
 }
 
-function flagValue(words, ...names) {
+/** Every value given for a flag: `-n prod`, `-n=prod`, `--namespace prod`, and kubectl's attached `-nprod`. */
+function flagValues(words, ...names) {
+  const out = [];
   for (let i = 0; i < words.length; i++) {
     for (const name of names) {
-      if (words[i] === name) return words[i + 1];
-      if (words[i].startsWith(`${name}=`)) return words[i].slice(name.length + 1);
+      if (words[i] === name) out.push(words[i + 1]);
+      else if (words[i].startsWith(`${name}=`)) out.push(words[i].slice(name.length + 1));
+      else if (/^-[A-Za-z]$/.test(name) && words[i].startsWith(name) && words[i].length > 2) out.push(words[i].slice(2));
     }
   }
-  return undefined;
+  return out;
+}
+
+function flagValue(words, ...names) {
+  return flagValues(words, ...names)[0];
 }
 
 /** What cannot be read as a known change is treated as the worst: a global destroy. */
@@ -129,43 +136,55 @@ export function inferChange(segment, { cwd = process.cwd(), blastRadius = "servi
       const k = normKind(kind);
       return `${ctx}/${k === "namespace" ? "-" : (flagNs ?? ns ?? "-")}/${k}/${name}`;
     };
+    // One object only: anything that names more (several names, several -f, a file with several
+    // documents) is ruled on as unreadable, never as its first object.
+    const MANY = Symbol("many");
     const target = (list) => {
       const [first, second] = list;
       if (!first) return null;
       if (first.includes("/")) {
         const [kind, name] = first.split("/");
+        if (list.length > 1) return MANY;
         return kind && name ? { kind, name } : null;
       }
+      if (list.length > 2) return MANY;
       return second && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(second) ? { kind: first, name: second } : null;
     };
+    const files = flagValues(words, "-f", "--filename");
     const fromFile = () => {
-      const file = flagValue(words, "-f", "--filename");
-      const text = file && readManifest(file, cwd);
+      if (files.length > 1) return MANY;
+      const text = files[0] && readManifest(files[0], cwd);
       if (text === undefined || text === null) return null;
       const doc = firstDocument(text);
+      if (doc.many) return MANY;
       return doc.kind && doc.name ? { ...doc, text } : null;
+    };
+    // Names and a file together: kubectl acts on both, so neither alone is the change.
+    const one = (named, filed) => {
+      if (named === MANY || filed === MANY || (named && filed)) return MANY;
+      return named ?? filed;
     };
 
     if (verb === "scale") {
       const replicas = Number(flagValue(words, "--replicas"));
-      const t = target(rest);
-      if (t && Number.isInteger(replicas) && replicas >= 0) return { ...base, action: { kind: "scale", resource: at(t.kind, t.name), replicas } };
+      const t = one(target(rest), files.length ? fromFile() ?? MANY : null);
+      if (t && t !== MANY && Number.isInteger(replicas) && replicas >= 0) return { ...base, action: { kind: "scale", resource: at(t.kind, t.name), replicas } };
       return unparseable(segment, priority);
     }
     if (verb === "delete") {
-      const t = target(rest) ?? fromFile();
-      if (!t || rest.includes("all") || words.includes("--all") || words.includes("-A") || flagValue(words, "-l", "--selector")) return unparseable(segment, priority);
+      const t = one(target(rest), files.length ? fromFile() ?? MANY : null);
+      if (!t || t === MANY || rest.includes("all") || words.includes("--all") || words.includes("-A") || flagValue(words, "-l", "--selector")) return unparseable(segment, priority);
       return { ...base, action: { kind: "destroy", resource: at(t.kind, t.name, t.namespace) } };
     }
     if (verb === "rollout") {
-      const t = ["restart", "undo", "pause", "resume"].includes(rest[0]?.toLowerCase()) ? target(rest.slice(1)) : null;
-      if (!t) return unparseable(segment, priority);
+      const t = ["restart", "undo", "pause", "resume"].includes(rest[0]?.toLowerCase()) ? one(target(rest.slice(1)), files.length ? MANY : null) : null;
+      if (!t || t === MANY) return unparseable(segment, priority);
       return { ...base, action: { kind: "apply", resource: at(t.kind, t.name), manifest } };
     }
     if (verb === "apply" || verb === "replace" || verb === "patch") {
-      const f = verb === "patch" ? null : fromFile();
-      const t = f ?? target(rest);
-      if (!t) return unparseable(segment, priority);
+      const f = verb === "patch" ? (files.length ? MANY : null) : files.length ? fromFile() ?? MANY : null;
+      const t = one(target(rest), f);
+      if (!t || t === MANY) return unparseable(segment, priority);
       const change = { ...base, action: { kind: "apply", resource: at(t.kind, t.name, t.namespace), manifest } };
       if (f && withContext) change.context = redactedContext(f.text);
       return change;
@@ -216,15 +235,22 @@ export function firstDocument(text) {
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       let doc = JSON.parse(trimmed);
-      if (Array.isArray(doc)) doc = doc[0];
+      if (Array.isArray(doc)) {
+        if (doc.length > 1) return { many: true };
+        doc = doc[0];
+      }
+      if (/^list$/i.test(String(doc?.kind ?? "")) || /List$/.test(String(doc?.kind ?? ""))) return { many: true };
       return { kind: doc?.kind, name: doc?.metadata?.name, namespace: doc?.metadata?.namespace };
     } catch {
       return {};
     }
   }
-  const doc = text.split(/^---\s*$/m).find((d) => d.trim() && !d.trim().split("\n").every((l) => l.trim().startsWith("#"))) ?? "";
+  const docs = text.split(/^---\s*$/m).filter((d) => d.trim() && !d.trim().split("\n").every((l) => l.trim().startsWith("#")));
+  if (docs.length > 1) return { many: true };
+  const doc = docs[0] ?? "";
   const lines = doc.split("\n");
   const out = { kind: lines.map((l) => /^kind:\s*["']?([A-Za-z0-9.]+)/.exec(l)).find(Boolean)?.[1] };
+  if (out.kind && /List$/.test(out.kind)) return { many: true };
   const at = lines.findIndex((l) => /^metadata:\s*$/.test(l));
   if (at >= 0) {
     let indent = null;

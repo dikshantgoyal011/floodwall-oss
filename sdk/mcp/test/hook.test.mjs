@@ -298,11 +298,11 @@ test("resources carry context and namespace, with kind aliases normalised", () =
   assert.equal(resource("helm uninstall web -n shop --kube-context eu").resource, "eu/shop/helm/web");
 });
 
-test("kubectl apply -f reads kind, name and namespace from the first document inside the working directory", () => {
+test("kubectl apply -f reads kind, name and namespace from a one-document file inside the working directory", () => {
   const cwd = mkdtempSync(join(tmpdir(), "fw-manifest-"));
   writeFileSync(
     join(cwd, "deploy.yaml"),
-    "# comment\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  labels:\n    name: not-this\n  name: ok-web\n  namespace: shop\nspec:\n  password: hunter2\n---\nkind: Service\nmetadata:\n  name: other\n",
+    "# comment\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  labels:\n    name: not-this\n  name: ok-web\n  namespace: shop\nspec:\n  password: hunter2\n",
   );
   writeFileSync(join(cwd, "d.json"), JSON.stringify({ kind: "Service", metadata: { name: "api", namespace: "x" } }));
   writeFileSync(join(cwd, "notes.txt"), "kind: Deployment");
@@ -318,6 +318,41 @@ test("kubectl apply -f reads kind, name and namespace from the first document in
     assert.equal(c.blastRadius, "global");
     assert.equal(c.context, undefined);
   }
+});
+
+test("a command acting on more than one object is never ruled on as its first: it is a global destroy", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "fw-many-"));
+  writeFileSync(join(cwd, "two.yaml"), "kind: ConfigMap\nmetadata:\n  name: tmp\n---\nkind: Deployment\nmetadata:\n  name: prod-db\n  namespace: prod\n");
+  writeFileSync(join(cwd, "list.yaml"), "kind: List\nitems:\n  - kind: Deployment\n    metadata:\n      name: prod-db\n");
+  writeFileSync(join(cwd, "arr.json"), JSON.stringify([{ kind: "ConfigMap", metadata: { name: "a" } }, { kind: "Deployment", metadata: { name: "prod-db" } }]));
+  writeFileSync(join(cwd, "a.yaml"), "kind: ConfigMap\nmetadata:\n  name: a\n");
+  writeFileSync(join(cwd, "b.yaml"), "kind: Deployment\nmetadata:\n  name: prod-db\n");
+  const change = (command) => inferChange(matchCommand(command, patterns).segment, { cwd });
+  for (const command of [
+    "kubectl delete deployment tmp prod-db",
+    "kubectl delete pod/x deployment/prod-db",
+    "kubectl scale deployment a prod-db --replicas=0",
+    "kubectl rollout restart deploy/a deploy/prod-db",
+    "kubectl delete -f two.yaml",
+    "kubectl apply -f two.yaml",
+    "kubectl apply -f list.yaml",
+    "kubectl apply -f arr.json",
+    "kubectl apply -f a.yaml -f b.yaml",
+    "kubectl delete deploy tmp -f b.yaml",
+  ]) {
+    const c = change(command);
+    assert.equal(c.action.kind, "destroy", command);
+    assert.equal(c.blastRadius, "global", command);
+    assert.match(c.action.resource, /^shell:/, command);
+  }
+});
+
+test("attached short flags are read: -nprod is namespace prod, -fx.yaml is the file", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "fw-attached-"));
+  writeFileSync(join(cwd, "b.yaml"), "kind: Deployment\nmetadata:\n  name: prod-db\n");
+  const change = (command) => inferChange(matchCommand(command, patterns).segment, { cwd });
+  assert.equal(change("kubectl delete deployment prod-db -nprod").action.resource, "-/prod/deployment/prod-db");
+  assert.equal(change("kubectl apply -fb.yaml -nprod").action.resource, "-/prod/deployment/prod-db");
 });
 
 test("a matching command that cannot be read is a global destroy, also when no verb is found", async () => {
