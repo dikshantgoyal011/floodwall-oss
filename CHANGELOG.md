@@ -6,68 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Layout fixes across the site and console.** The console's tables (Intents,
-  Ledger, API keys, Admin) ran past the screen's edge, header row and all,
-  whenever they were wider than their panel on a screen over 860px: long
-  names or summaries, a laptop at 125-150% scaling, or a narrower window. They
-  now pin their header row only when they fit, and otherwise scroll sideways
-  inside the panel, with a scrollbar for a mouse. A dropdown (the plane picker
-  among them) opened over its own button, 4px off, so the button seemed to
-  grow a second border and a tick; it now opens below. The docs' "Ledger"
-  headings (Concepts, HTTP API, Console guide) were 640px tall on screens
-  1100px and wider, picking up the landing page's `#ledger` section height,
-  which left a blank screen under them, and every `#` link stopped a header's
-  height too low. The site's header no longer wraps Pricing onto a second
-  line between 851px and 1180px, keeps a phone to two rows instead of three,
-  shows a first and last name in full, and hangs the account menu from the
-  page's margin. Docs tables keep their prose column readable instead of
-  squeezing it to a word a line. The console's sidebar scrolls on a short
-  window instead of hiding the account and sign-out below it, and wraps a
-  name instead of cutting it to "Dikshan…". The processing line's stage list
-  no longer starts a wrapped row with an arrow.
-
-- **The AI features' default model is `deepseek/deepseek-v4-flash`.** The
-  earlier default, `anthropic/claude-opus-5-5`, is not an OpenRouter model id
-  (OpenRouter writes `claude-opus-5.5`), so every model call failed once a key
-  was set. DeepSeek V4 Flash was chosen from every OpenRouter model with
-  strict JSON outputs and endpoints that neither train on nor keep prompts,
-  ranked on LiveBench (2026-06-25) for reasoning, instruction following, data
-  analysis and language against cost: about $0.36 per thousand calls, against
-  roughly $16 for Opus 5.5. `AI_MODEL` still picks any other model
-  (`deepseek/deepseek-v4-pro` is the step up). Requests no longer send
-  `temperature`, which current Claude and OpenAI models refuse, and ask for
-  low reasoning effort.
-
 ### Added
-
-- **Error alerts (FW-801).** An unhandled error in an API request, a failed
-  cron run or daily job, a failing plane alarm, a failed background task, or a
-  script error on the site (sent to the new `POST /errors`) now emails the
-  operators in `ADMIN_EMAILS` and, with the optional `ALERT_WEBHOOK_URL` secret,
-  posts to a Slack or Discord webhook. Each error signature alerts at most once
-  an hour (`error_alerts`, migration `0014`), at most 30 alerts go out an hour
-  for the Worker's failures and 5 for the site's (unverified) reports, and secrets, tokens, cookies, query strings and email addresses are
-  redacted before anything is stored or sent. `POST /errors` takes only the
-  allowed sites, 8 KB at most, 20 reports an hour per network.
-
-- **Account controls (FW-608).** Settings lists the devices signed in to the
-  account (browser, country, when it signed in and was last active, and which
-  is this one) and signs out one of them, every other one, or all of them.
-  The address can be changed with a code sent to the new one and another to
-  the current one: the old address is told and other devices are signed out.
-  A member who must sign in with SSO can't move off their organization's
-  address. The account can be
-  deleted with a code sent to its address, which removes its planes (ledgers,
-  R2 archives, keys), memberships, invites, sessions and the user row at
-  once; it is refused while other people are on the account or a paid plan
-  isn't set to cancel. Ledger lines in other accounts' planes stay (they are
-  hash-chained audit records); billing records stay with Paygate as tax law
-  requires. New routes under `/auth/account/` (api/README.md, "Account
-  controls"); migration `0015_account_controls.sql` adds the sessions'
-  `last_seen_at`, `device` and `country`, the `account_codes` table, and
-  `usage_pending.plan` (a deleted account's unreported usage is still billed).
 
 - `@floodwall/client` 0.2.0 and Python `floodwall` 0.2.0: an optional
   `context` (a diff or plan, at most 64 KiB) on `submit` and `guard`, sent as
@@ -92,11 +31,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Hosted planes refuse a different intent under a finished key** (409
-  `duplicate`) on every plane, not only those with a keyring. Before, a
-  plane without a keyring ruled on it as new, which also let an agent reuse
-  a finished key to skip the AI review. The same intent sent again still
-  answers its stored status. The SDKs never reuse ids.
 - **The Claude Code / Agent SDK hook rules a kubectl command that acts on
   more than one object as a global destroy**: several names, several `-f`,
   names with `-f`, or a file with several documents or a `List`. Before, it
@@ -325,7 +259,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   expiries are reported in `TickReport::expired`. The ledger records
   `released` and `expired` with who did it and why, and a released
   decision's reason lists what was overridden (`Decision::released_by`).
-- Demo, README and site for v0.2 (FW-207). The demo follows a flood
+- Demo and README for v0.2 (FW-207). The demo follows a flood
   through scheduling, conflicts, an operator working the hold queue, and
   completions. The README's examples are compiled and run as doctests.
 - `tests/scheduler_invariants.rs`: 300 seeded random floods through the
