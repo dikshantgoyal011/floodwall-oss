@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Layout fixes across the site and console.** The console's tables (Intents,
+  Ledger, API keys, Admin) ran past the screen's edge, header row and all,
+  whenever they were wider than their panel on a screen over 860px: long
+  names or summaries, a laptop at 125-150% scaling, or a narrower window. They
+  now pin their header row only when they fit, and otherwise scroll sideways
+  inside the panel, with a scrollbar for a mouse. A dropdown (the plane picker
+  among them) opened over its own button, 4px off, so the button seemed to
+  grow a second border and a tick; it now opens below. The docs' "Ledger"
+  headings (Concepts, HTTP API, Console guide) were 640px tall on screens
+  1100px and wider, picking up the landing page's `#ledger` section height,
+  which left a blank screen under them, and every `#` link stopped a header's
+  height too low. The site's header no longer wraps Pricing onto a second
+  line between 851px and 1180px, keeps a phone to two rows instead of three,
+  shows a first and last name in full, and hangs the account menu from the
+  page's margin. Docs tables keep their prose column readable instead of
+  squeezing it to a word a line. The console's sidebar scrolls on a short
+  window instead of hiding the account and sign-out below it, and wraps a
+  name instead of cutting it to "Dikshan…". The processing line's stage list
+  no longer starts a wrapped row with an arrow.
+
 - **The AI features' default model is `deepseek/deepseek-v4-flash`.** The
   earlier default, `anthropic/claude-opus-5-5`, is not an OpenRouter model id
   (OpenRouter writes `claude-opus-5.5`), so every model call failed once a key
