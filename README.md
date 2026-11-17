@@ -469,7 +469,7 @@ Five agents (including a `chaos-monkey`) fling 4000 changes at the wall. Admissi
 | 0.4 | Persistence + replay: a durable ledger on disk, every record's tick, and a plane rebuilt exactly by replaying its ledger | **done** |
 | 0.5 | Policy-as-code: declarative rules, a worked OPA-style example, and versioned policy bundles recorded with every decision | **done** |
 
-See [GOALS.md](GOALS.md) for the full roadmap and [STATUS.md](STATUS.md) for current state.
+See the [CHANGELOG](CHANGELOG.md) for what changed in each release.
 
 ## Design notes
 

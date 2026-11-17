@@ -10,9 +10,6 @@ readme = "README.md"
 keywords = ["devops", "control-plane", "agents", "admission-control", "policy"]
 categories = ["concurrency", "command-line-utilities"]
 
-[workspace]
-members = ["wasm"]
-
 [dependencies]
 
 [dev-dependencies]

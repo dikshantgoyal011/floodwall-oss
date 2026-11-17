@@ -50,57 +50,7 @@ jobs:
           node tools/verify-ledger.mjs target/export-fixture/edge-suffix.jsonl target/export-fixture/keys.json
           node tools/verify-ledger.mjs target/export-fixture/durable.jsonl target/export-fixture/keys.json
           cmp target/export-fixture/edge.jsonl target/export-fixture/durable.jsonl
-          node --test tools/verify-ledger.test.mjs tools/deploybot.test.mjs
-  frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-      - name: install
-        run: npm --prefix site ci
-      - name: check
-        run: npm --prefix site run check
-      # `check` rebuilds the site into docs/, which GitHub Pages serves. Any
-      # difference from what is committed means docs/ was not rebuilt after a
-      # change to site/.
-      - name: docs in sync
-        run: |
-          if [ -n "$(git status --porcelain -- docs)" ]; then
-            echo "::error::docs/ is out of date with site/. Run 'npm --prefix site run build' and commit docs/."
-            git status --short -- docs
-            exit 1
-          fi
-  # The sign-in service (api/): typecheck, bundle it as a deploy would, and
-  # run its tests against the bundle in the Workers runtime, with a local D1
-  # database, the planes' Durable Objects and a stand-in for Resend.
-  api:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: api/package-lock.json
-      # The Worker runs each plane as the crate compiled to WebAssembly
-      # (`npm run wasm`, part of `build`). rustup is on the runner; this
-      # installs the toolchain and wasm32 target rust-toolchain.toml pins
-      # (`rustup show` did that before rustup 1.28).
-      - name: rust
-        run: rustup toolchain install || rustup show
-      - name: install
-        run: npm --prefix api ci
-      - name: check
-        run: npm --prefix api run check
-
+          node --test tools/verify-ledger.test.mjs
   sdk:
     runs-on: ubuntu-latest
     steps:
